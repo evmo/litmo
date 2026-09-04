@@ -11,8 +11,11 @@ below read as what they do rather than as plumbing.
 
 Both pulls stage. Nothing arriving from the bucket touches the working tree
 until it has been downloaded in full, checked against the manifest's sizes and
-digests, and — for an archive — hashed as a whole tree. A failed pull costs a
-non-zero exit and leaves the previous local copy exactly as it was.
+digests, and — for an archive — hashed as a whole tree. Failures before install
+leave the previous local copy exactly as it was. Archive installation swaps a
+whole tree; mirror installation moves independently named files one at a time,
+so an unexpected operating-system failure in that final step can leave a
+partially updated mirror.
 """
 
 from __future__ import annotations

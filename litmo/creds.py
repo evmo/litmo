@@ -27,6 +27,9 @@ EXAMPLE = """\
 # is git-ignored, and fill in. Any of these may instead be set in the
 # environment, which takes precedence — that is the path for CI.
 #
+# `R2_BUCKET` is also accepted as an environment-only legacy alias for
+# `R2_BUCKET_NAME`.
+#
 # The token needs Object Read & Write on this one bucket and nothing else.
 # Keep the file private — `chmod 600 .r2`. litmo refuses to load a secret
 # that other users on the machine can read.

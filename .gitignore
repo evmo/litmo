@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 dist/
+
+# Repository-local write credentials. Keep the blank template tracked.
+/.r2

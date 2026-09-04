@@ -137,6 +137,18 @@ class TestConfig(Base):
         self.assertEqual(names, {"cache": "archive", "out": "mirror"})
         self.assertEqual(self.cfg.base, "https://example.invalid/mirror")
 
+    def test_public_schemas_name_the_behavior_changing_optional_keys(self):
+        readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text()
+        for docs in (config.__doc__, readme):
+            docs = docs.replace("`litmo pull`", "`pull`")
+            docs = docs.replace("`litmo push`", "`push`")
+            docs = docs.replace("`litmo status`", "`status`")
+            docs = " ".join(docs.split())
+            self.assertIn('manifest = "manifest.json"', docs)
+            self.assertIn("manual = true", docs)
+            self.assertIn("bare `pull` or `push`", docs)
+            self.assertRegex(docs, r"`status` (still|always) reports")
+
     def test_select_rejects_unknown(self):
         self.assertEqual([a.name for a in self.cfg.select(["out"])], ["out"])
         with self.assertRaises(SystemExit):
@@ -184,6 +196,14 @@ class TestConfig(Base):
         self.assertEqual([a.name for a in cfg.select(["stages"])], ["stages"])
         self.assertIn("stages",
                       [a.name for a in cfg.select(None, include_manual=True)])
+
+    def test_manual_must_be_a_toml_boolean_not_a_truthy_value(self):
+        for bad in ('"false"', '"true"', "1", "[]", "{}"):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit) as e:
+                self.reload(SYNC_TOML.replace(
+                    '[artifact.out]\nkind = "mirror"',
+                    f'[artifact.out]\nkind = "mirror"\nmanual = {bad}'))
+            self.assertIn("manual must be true or false", str(e.exception))
 
     def test_archive_without_key_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -353,6 +373,11 @@ class TestCreds(Base):
         p.write_text(text)
         p.chmod(mode)
         return p
+
+    def test_checkout_ships_an_ignored_example_matching_the_loader(self):
+        checkout = Path(__file__).resolve().parents[1]
+        self.assertEqual((checkout / ".r2.example").read_text(), creds.EXAMPLE)
+        self.assertIn("/.r2", (checkout / ".gitignore").read_text().splitlines())
 
     def test_loads_a_private_file(self):
         self.creds_file(self.FULL, 0o600)
@@ -2364,6 +2389,21 @@ class StubS3:
         return {"Body": Response(self.stored), "ETag": '"e"'}
 
 
+class StubUnsupportedConditional:
+    """Reject preconditions, but would accept an unsafe unconditional put."""
+
+    def __init__(self):
+        self.calls = []
+
+    def put_object(self, **kw):
+        import botocore.exceptions
+        self.calls.append(kw)
+        if "IfMatch" in kw or "IfNoneMatch" in kw:
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "NotImplemented"},
+                 "ResponseMetadata": {"HTTPStatusCode": 501}}, "PutObject")
+
+
 class StubDownload:
     """`download_file` the way s3transfer drives it.
 
@@ -2497,6 +2537,16 @@ class TestConditionalWrite(Base):
         with self.assertRaises(Conflict):
             self.remote(stub).put_bytes("m.json", self.BODY,
                                         "application/json", if_absent=True)
+
+    def test_unsupported_preconditions_never_retry_unconditionally(self):
+        stub = StubUnsupportedConditional()
+        with self.assertRaises(SystemExit) as e:
+            self.remote(stub).put_bytes("m.json", self.BODY,
+                                        "application/json", if_match="v1")
+        self.assertIn("was not written", str(e.exception))
+        self.assertIn("could overwrite another maintainer", str(e.exception))
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(stub.calls[0]["IfMatch"], '"v1"')
 
 
 # --- end to end, through the real transport ---------------------------------
@@ -2689,6 +2739,27 @@ class TestSharedMakefile(Base):
             rc = cli.main(["mk"])
         self.assertEqual(rc, 0)
         return out.getvalue()
+
+    def test_readme_makefile_bootstraps_and_names_real_visible_targets(self):
+        readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text()
+        sample = readme.split("```make\n", 1)[1].split("```", 1)[0]
+        self.assertIn("common.mk: ; uv run litmo mk > $@", sample)
+        self.assertIn("REPRODUCE := env sync build render", sample)
+        self.assertNotIn("REPRODUCE := env fetch", sample)
+        self.assertIn("build:  ##", sample)
+        self.assertIn("check:  ##", sample)
+
+    def test_central_docs_match_the_generated_document_convention(self):
+        readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text()
+        package_docs = __import__("litmo").__doc__
+        generated = self.packaged.read_text(encoding="utf-8")
+        for docs in (readme, package_docs, generated):
+            self.assertRegex(docs, r"(?:documents do no|no document does) arithmetic")
+        for docs in (readme, package_docs):
+            docs = " ".join(docs.split())
+            self.assertIn("may read stored artifacts", docs)
+            self.assertIn("or call", docs)
+            self.assertNotIn("documents only read", docs)
 
     def test_mk_prints_the_packaged_file_verbatim(self):
         # The bytes a consumer's Makefile redirects into its own common.mk.

@@ -4,8 +4,9 @@
     # Optional. A public HTTPS base for credential-free reads. When it is set,
     # `pull` and `status` go over plain HTTPS and a reader needs no
     # credentials; when it is absent they use the S3 API and .r2.
-    base   = "https://artifacts.example.org"
-    bucket = "project-artifacts"       # or leave to R2_BUCKET_NAME
+    base     = "https://artifacts.example.org"
+    bucket   = "project-artifacts"     # or leave to R2_BUCKET_NAME
+    manifest = "manifest.json"         # optional object key; this is default
 
     [artifact.cache]
     kind = "archive"                   # one tar.zst bundle, tree-hash identity
@@ -22,6 +23,10 @@
     kind = "fetch"                     # pull-only; someone else publishes it
     url  = "https://data.example.org/positions/all-positions.csv.gz"
     path = "data/all-positions.csv.gz"
+    manual = true                       # only moved when named explicitly
+
+`manual = true` is valid on every artifact kind. A bare `pull` or `push` skips
+it, an explicitly named command includes it, and `status` still reports it.
 
 Which kind to use is a question about the files, not about taste:
 
@@ -225,6 +230,10 @@ def load(root: Path | None = None) -> Config:
                              f"files a mirror publishes, and nothing reads it "
                              f"on {'an' if kind[:1] in 'aeiou' else 'a'} "
                              f"{kind}. Remove it, or make this a mirror.")
+        manual = spec.get("manual", False)
+        if not isinstance(manual, bool):
+            raise SystemExit(f"artifact {name!r}: manual must be true or false, "
+                             f"not {manual!r}")
         if kind == "archive":
             _rel(spec["key"], name, "key")
         arts.append(Artifact(
@@ -235,7 +244,7 @@ def load(root: Path | None = None) -> Config:
             key=spec.get("key", ""),
             url=spec.get("url", ""),
             include=_include(spec.get("include"), name),
-            manual=bool(spec.get("manual", False)),
+            manual=manual,
         ))
 
     if not arts:

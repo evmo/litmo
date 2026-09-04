@@ -282,8 +282,8 @@ class Remote:
         was not there at all. Either way a second maintainer who published
         between the read and this write gets a refusal rather than having
         their entries dropped. A store that does not implement conditional
-        writes says so, and is written to unconditionally with a warning —
-        losing the precondition is better than losing the push.
+        writes is refused: publishing without the precondition would silently
+        discard that safety property.
         """
         import botocore.exceptions
         extra = {}
@@ -320,11 +320,13 @@ class Remote:
                     f"will re-read the manifest and merge."
                 ) from None
             if code in ("NotImplemented", "InvalidRequest") or status == 501:
-                print(f"  note: {self.where} does not support conditional "
-                      f"writes — writing {key} unconditionally")
-                self._s3.put_object(Bucket=self._bucket, Key=key, Body=body,
-                                    ContentType=content_type)
-                return
+                raise SystemExit(
+                    f"  {self.where} does not support conditional writes, so "
+                    f"{key} was not written.\n"
+                    f"  Publishing it unconditionally could overwrite "
+                    f"another maintainer's push; use an object store that "
+                    f"supports If-Match and If-None-Match."
+                ) from None
             raise
 
 

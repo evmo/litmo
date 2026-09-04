@@ -13,7 +13,7 @@ more than the code was worth.
 
 One rule, and the rest follows from wanting it to be checkable:
 
-> **The pipeline writes `out/`. The documents only read it.**
+> **Analysis modules do all the computing; documents do no arithmetic.**
 
 So the layout is:
 
@@ -41,9 +41,13 @@ make reproduce  everything, from an empty checkout
 make clean      remove derived files
 ```
 
-Because a document computes nothing, `freeze: false` is safe everywhere — a
-rendered report cannot be quoting a stale number, since it has no cache to
-quote from.
+Those commands are the interface litmo gives its consuming analysis
+repositories; they are not this package's development commands.
+
+A document may read stored artifacts from `out/`, or call analysis modules and
+format what they return. The latter recomputes from inputs on every render.
+Either way `freeze: false` is safe: the document owns no computation or cached
+number that can drift from the analysis code.
 
 ## Using it
 
@@ -56,15 +60,15 @@ A repository's `Makefile` is then the small part that is genuinely its own:
 
 ```make
 FORMATS   := gfm html
-REPRODUCE := env fetch build render
+REPRODUCE := env sync build render
 
 -include common.mk
-common.mk: ; $(UV) litmo mk > $@
+common.mk: ; uv run litmo mk > $@
 
-build:
+build:  ## run the pipeline
 	uv run python -m mypkg.pipeline all
 
-check:
+check:  ## run tests and validators
 	uv run pytest
 ```
 
@@ -81,7 +85,8 @@ Each repository declares what it publishes in `sync.toml`:
 
 ```toml
 [remote]
-base = "https://artifacts.example.org"   # optional: public reads
+base = "https://artifacts.example.org"  # optional: public reads
+manifest = "manifest.json"              # optional object key; this is default
 
 [artifact.cache]
 kind = "archive"
@@ -89,6 +94,11 @@ path = "data/cache"
 key  = "v1/data-cache.tar.zst"
 what = "raw API responses, keyed by hash of their parameters"
 ```
+
+Every artifact kind also accepts `manual = true`. A bare `litmo pull` or
+`litmo push` skips a manual artifact; naming it explicitly includes it, while
+`litmo status` always reports it. This is useful for a refetchable input that
+is tracked in Git and should only be overwritten deliberately.
 
 Three kinds, chosen by what the files are rather than by taste:
 
@@ -111,9 +121,12 @@ Everything a reader trusts comes from that one object, so it is not taken on
 faith. Its shape and every digest in it are checked before anything is acted
 on, and no path in it can name a file outside the artifact that claims it.
 Both pulls stage: a bundle or a set of files is downloaded in full and checked
-against the manifest before a single byte of the working tree changes, so a
-failed pull is a non-zero exit and an untouched checkout rather than a
-half-updated one.
+against the manifest before a single byte of the working tree changes. A
+download or verification failure, or a known local layout conflict, therefore
+leaves the checkout untouched. An archive then installs with a whole-tree swap;
+a mirror has to install its independently named files one at a time, so an
+unexpected operating-system error during that final step can leave earlier
+files updated. Correct the error and rerun the pull.
 
 Publishing is not a transaction, and litmo does not claim to be one. Objects
 are stored under their own names — that is what makes a public bucket
@@ -135,7 +148,34 @@ Credentials come from `.r2` at the repository root (git-ignored) or from the
 environment, which wins — a laptop supplies them without an export, CI without
 a file. If `.r2` holds a secret and other users on the machine can read it,
 loading is refused rather than warned about: it is a live write credential for
-a bucket readers trust, so `chmod 600 .r2`.
+a bucket readers trust. Start from the shipped template:
+
+```sh
+cp .r2.example .r2
+chmod 600 .r2
+```
+
+The canonical file and environment names are `R2_ACCOUNT_ID`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET_NAME`. The legacy
+name `R2_BUCKET` is also accepted from the environment as an alias for
+`R2_BUCKET_NAME`.
+
+## Contributing to litmo
+
+This repository itself has no Makefile. From a fresh clone, install
+[uv](https://docs.astral.sh/uv/), then create the locked development environment
+and run the same checks as CI:
+
+```sh
+uv sync --all-extras
+uv run python -m unittest discover -s tests -v
+uv run --locked ruff check litmo tests
+uv lock --check
+uv build
+```
+
+The project supports Python 3.12, 3.13, and 3.14; CI runs the suite under all
+three. A local run uses the interpreter selected by uv for this checkout.
 
 ## License
 

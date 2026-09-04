@@ -138,7 +138,8 @@ def cmd_push(args) -> int:
 def cmd_status(args) -> int:
     cfg = config.load()
     ctx = Ctx(cfg)
-    # Manual artifacts are listed here even though a bare pull skips them:
+    # Manual artifacts are listed here even though a bare pull or push skips
+    # them:
     # status moves nothing, and an input that has drifted upstream is exactly
     # what you want this command to tell you.
     arts = cfg.select(args.artifacts, include_manual=True)
@@ -156,8 +157,8 @@ def cmd_status(args) -> int:
               f"{'  [manual]' if art.manual else ''}"
               f"{'  — ' + art.what if art.what else ''}")
     if any(a.manual for a in arts):
-        print("\n  [manual] artifacts are skipped by a bare pull — name one to "
-              "move it:\n    uv run litmo pull "
+        print("\n  [manual] artifacts are skipped by a bare pull or push — name "
+              "one to move it:\n    uv run litmo pull "
               f"{next(a.name for a in arts if a.manual)}")
     ctx.save()
     return rc
