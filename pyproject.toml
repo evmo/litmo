@@ -49,11 +49,30 @@ Changelog = "https://github.com/evmo/litmo/blob/main/CHANGELOG.md"
 litmo = "litmo.cli:main"
 
 [build-system]
-# Pinned exactly: an unconstrained `requires` resolves whatever Hatchling is
-# newest at build time, in an isolated environment `uv.lock` never sees, so
-# the backend could change what the wheel contains with no edit here. Bump
-# this deliberately and check the wheel still carries common.mk and py.typed.
-requires = ["hatchling==1.32.0"]
+# Pinned exactly, and the whole closure of it: an unconstrained `requires`
+# resolves whatever is newest at build time, in an isolated environment
+# `uv.lock` never sees, so the backend could change what the wheel contains
+# with no edit here. Hatchling's own five dependencies float
+# (`packaging>=24.2`, `pathspec>=0.10.1`, `pluggy>=1.0.0`, `tomlkit>=0.11.1`,
+# `trove-classifiers`), and wheel creation imports four of them, so naming
+# only the backend leaves most of the build environment unchosen. They are
+# listed here rather than in a `uv build --build-constraints` file because
+# this also reaches a consumer building the sdist, which that file does not.
+#
+# To bump: change the Hatchling pin, re-derive the rest with
+#   uv build -v 2>&1 | grep 'Adding transitive dependency'
+# and check the wheel still carries common.mk and py.typed. The closure's
+# names are asserted in tests/test_supply_chain.py, so a Hatchling release
+# that adds or drops a dependency fails there rather than quietly resolving
+# it at build time.
+requires = [
+  "hatchling==1.32.0",
+  "packaging==26.3",
+  "pathspec==1.1.1",
+  "pluggy==1.6.0",
+  "tomlkit==0.15.1",
+  "trove-classifiers==2026.6.1.19",
+]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
