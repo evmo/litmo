@@ -44,6 +44,90 @@ true, delete it.
 
 ## Real, and deliberately not changed
 
+- **`litmo/kinds.py:1102` — a failed mirror install still leaves a mix of two
+  published generations, and there is no per-file rollback journal.**
+  Reported by audit-failure-modes on 2026-09-04 as medium. Reproduced with a
+  three-file `--clean` pull failing `EACCES` on its second `_move`:
+  `out/a.csv` held the published bytes while `b.csv` and `c.csv` held the
+  local ones. **Half of it was fixed** — the `--clean` sweep now runs after
+  the install loop instead of before it, because an extra is a local-only
+  file that no bucket has, so deleting it and then failing was the one
+  outcome re-running the pull could not undo. `out/extra.csv` survives that
+  same failure now.
+
+  The other half of the report's fix — journal each replacement with a
+  sibling backup and restore the completed moves on error — is not taken,
+  because what is left costs no data. Every published file a failed install
+  leaves behind is one whole generation or the other, and a mirror pull
+  overwrites local edits to published files by design, so a partial install
+  takes nothing a successful one would not have taken. Recovery is measured,
+  not assumed: re-running the same pull downloaded `2 of 3 files` and ended
+  with all three at `PUBLISHED-*`. The pull also exits non-zero, so `make
+  sync` stops rather than rendering against the mix.
+
+  Against that, the journal is new failure-path machinery on the one path
+  that touches the working tree, and `_swap`'s own docstring is a record of
+  how that goes wrong. It cannot park into the staging directory — an
+  artifact symlinked to another disk makes that `EXDEV`, which is the lesson
+  `_swap` already learned — so the parks have to be siblings inside the
+  artifact, which brings three more things with it: two concurrent mirror
+  pulls would then share park names and destroy each other exactly as
+  `_swap` did before `_installing` (so the fix would first have to extend
+  that lock to mirror installs), a killed pull would leave `.x.csv.litmo-old`
+  files inside the artifact, and `_covers` would need a new exclusion or the
+  next `push` would publish them. The report's own alternative — stage the
+  whole tree and swap it archive-style — is refused by what a mirror is for:
+  a swap deletes local extras, and a pull without `--clean` may not.
+
+  What would change this: a consumer whose pull genuinely fails mid-install
+  more than once, or a `_move` that starts failing for a reason a re-run
+  cannot clear. Then the lock moves to the mirror install first, and the
+  journal goes on top of it. Accepted 2026-09-04.
+
+- **`litmo/kinds.py:1196` and `:805` — a losing or failed push really can
+  leave the committed manifest describing bytes the bucket no longer holds,
+  and the object keys are staying mutable.**
+  Reported by audit-failure-modes on 2026-09-04 as high. Reproduced here on
+  both kinds, against the real `mirror_push`/`archive_push` and the real
+  manifest commit at `cli.py:128`, two publishers sharing one in-memory
+  bucket. Both read `etag-2`; A uploaded `AAAA` to `out/x.csv`, B uploaded
+  `BBBB` over the same key, A's conditional manifest PUT won and B's was
+  refused. The published manifest then said `4677942dfa3e74b5…` (the sha of
+  `AAAA`) while the object held `BBBB`. The archive half is identical:
+  manifest `archive_sha256 741f7a0694ff47aa…`, bundle in the bucket
+  `030abd19cdea6fff…`. The same end state is reachable with one publisher —
+  any manifest PUT that fails after the objects are up.
+
+  What keeps this off the fix list is the blast radius on the reader, which
+  the report does not weigh. Both kinds fail **closed**, loudly, before
+  touching anything: the mirror pull raised `out: 1 of 1 file(s) failed
+  verification — nothing under out was changed` and the archive pull
+  `cache: archive failed verification — data/cache was not touched`, and in
+  both cases the reader's own file was still `reader-local` afterwards. No
+  reader is given wrong bytes and no local copy is lost; pulls simply refuse
+  until a maintainer re-runs `litmo push`, which is one command and is what
+  the `Conflict` message already tells them to do.
+
+  Against that, the report's own smallest fix — content-addressed or unique
+  staging keys, with the manifest as the sole commit point — is the one
+  change this repository has explicitly decided against. README:110 gives
+  the reason in its own words: "Objects are stored under their own names —
+  that is what makes a public bucket browsable", and the mirror kind exists
+  so "a reader can fetch one file without the rest" at its published name.
+  Immutable keys would change every reader's URL, need a garbage collector
+  for superseded generations, and require re-uploading three live buckets.
+  There is no smaller correct version of it: object-level `If-Match` would
+  need per-object ETags in the manifest and a write path that is not
+  `upload_file` (which cannot take a precondition at all), and it still would
+  not cover a manifest PUT that fails for a network reason after the objects
+  are up. README:132 already says the honest thing — "Publishing is not a
+  transaction, and litmo does not claim to be one."
+
+  What would change this: publishing moving from a maintainer at a keyboard
+  to something automated that can genuinely run twice at once — a CI job on
+  push, or a scheduled republish — where the window stops being two people
+  who can talk to each other. Accepted 2026-09-04.
+
 - **`litmo/paths.py` — `relative` accepts Unicode bidi overrides, and that
   is where the line is drawn.**
   Not from an audit: noticed while fixing the audit-security finding that

@@ -137,6 +137,39 @@ tolerated are now refused, and two commands exit differently.
 - **A failed `make mk-update` truncated `common.mk` to nothing**, which
   `include` loads happily, taking every shared target with it. Written to a
   sibling and renamed.
+- **Two archive pulls at once could leave the artifact absent.** Both swaps
+  parked the outgoing tree under the same `.NAME.litmo-old`, so the second
+  read the first's park as a dead run's leftover and deleted it; the first's
+  rename then failed, its rollback deleted the second's tree, and there was
+  no park left to restore — with the second pull having reported success.
+  Installation now takes an advisory lock per artifact, waits for the other
+  process, and after five minutes says so rather than hanging.
+- **A push could publish a digest the bucket does not hold.** Both kinds
+  re-read what they had just sent to catch a build still writing underneath
+  the publish, and neither could see a rewrite that was undone before that
+  re-read: a file rewritten in place while it was being uploaded, or while
+  the bundle was being packed, and then put back left the object holding a
+  mixture the re-read agreed with, and every reader's pull failed on it. Both
+  re-reads now check the file's modification time as well as its bytes. This
+  can only refuse a push, never accept one.
+- **A failed `pull --clean` deleted local-only files for a pull that never
+  finished.** The sweep ran before the install, so an error partway through
+  left a mixture of two generations *and* the local extras already gone — the
+  one thing re-running the pull cannot bring back. The sweep now runs after
+  the files are in place.
+- **A slow enough server could hold a pull open indefinitely.** The socket
+  timeout bounds one read, not a transfer, so a byte sent just before each one
+  expired kept a request alive without ever raising — the retry logic never
+  got a say. Reads are now held to a floor of a kibibyte a second, measured
+  over the whole transfer and applied only after the socket timeout has
+  passed, so a large download over a slow link is unaffected.
+- **Rate limits were retried inside the window the server asked for.** A `429`
+  or `503` carrying `Retry-After: 60` got all three attempts within two
+  seconds and then failed. The wait is honoured now, capped at two minutes.
+- **`doctor` reported a broken quarto as `ok`.** A quarto on `PATH` whose
+  `--version` exits non-zero — a missing shared library, a half-finished
+  install — printed an empty version and exited 0. It now fails, with the
+  first lines of what quarto said.
 
 ### Added
 

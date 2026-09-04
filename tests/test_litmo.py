@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import datetime
+import email.message
+import email.utils
 import errno
 import hashlib
 import http.client
@@ -1084,6 +1087,63 @@ class TestMirror(Base):
         landed = [p for p in listed if listed[p] != v1[p]]
         self.assertEqual(len(landed), 5, listed)
 
+    def test_a_rewrite_undone_before_the_re_read_is_still_refused(self):
+        # `upload_file` reads the source in parts, and re-reads a part it
+        # retries, so a writer working in place puts different generations
+        # into different parts of one object. Re-reading the file afterwards
+        # cannot see that if the writer put the original bytes back: the push
+        # published the digest of sixteen A while the object held
+        # AAAAAAAABBBBBBBB, and said nothing.
+        f = self.write("out/x.csv", "A" * 16)
+        read_half, mutated, uploaded, restored = (threading.Event()
+                                                  for _ in range(4))
+
+        class Chunked(Fake):
+            def upload(self, src, key, content_type):
+                self.uploads += 1
+                with open(src, "rb", buffering=0) as fh:   # parts, separately
+                    first = fh.read(8)
+                    read_half.set()
+                    mutated.wait(10)
+                    rest = fh.read()
+                self.objects[key] = first + rest
+                self._stamp(key)
+                # A real upload spends most of its wall clock after the last
+                # read of the source: parts in flight, then the complete call.
+                uploaded.set()
+                restored.wait(10)
+
+        def writer():
+            read_half.wait(10)
+            with open(f, "r+b") as fh:          # in place, same size
+                fh.seek(8)
+                fh.write(b"B" * 8)
+            mutated.set()
+            uploaded.wait(10)
+            with open(f, "r+b") as fh:          # ... and put back
+                fh.seek(8)
+                fh.write(b"A" * 8)
+            restored.set()
+
+        remote, man = Chunked(), Manifest({})
+        ctx = self.ctx(man, remote)
+        t = threading.Thread(target=writer)
+        t.start()
+        self.addCleanup(t.join)
+        with self.assertRaises(SystemExit) as e:
+            kinds.mirror_push(ctx, self.art())
+        t.join(10)
+
+        self.assertIn("rewritten while they were uploading", str(e.exception))
+        self.assertIn("out/x.csv", str(e.exception))
+        # The bytes on disk are back to what they were, so only the timestamp
+        # could have told anyone. The object really did move …
+        self.assertEqual(f.read_bytes(), b"A" * 16)
+        self.assertEqual(remote.objects["out/x.csv"], b"A" * 8 + b"B" * 8)
+        # … so the file is left out of the manifest rather than published
+        # under a digest the bucket does not hold.
+        self.assertEqual(man.mirror_files("out"), [])
+
     def test_a_put_that_lands_but_cannot_be_re_read_is_dropped(self):
         # The PUT returned, so the object has moved; if the re-read that
         # decides whether the bytes are describable then blows up, the file
@@ -1101,10 +1161,10 @@ class TestMirror(Base):
         self.write("out/b.csv", "v2")
         real_unchanged = kinds._unchanged
 
-        def unchanged(path, e):
+        def unchanged(path, e, stamp=None):
             if path.name == "a.csv":
                 raise RuntimeError("stat blew up after the PUT")
-            return real_unchanged(path, e)
+            return real_unchanged(path, e, stamp)
 
         with unittest.mock.patch.object(kinds, "_unchanged", unchanged):
             with self.assertRaises(RuntimeError):
@@ -1203,7 +1263,7 @@ class TestMirror(Base):
         kinds.mirror_push(ctx, self.art())
         self.write("out/x.csv", "v2")
 
-        def interrupted(path, e):
+        def interrupted(path, e, stamp=None):
             raise KeyboardInterrupt("^C during the post-upload re-hash")
 
         with unittest.mock.patch.object(kinds, "_unchanged", interrupted):
@@ -1299,6 +1359,47 @@ class TestMirror(Base):
         self.write("out/extra.csv", "x")
         kinds.mirror_pull(ctx, self.art(), clean=True)
         self.assertFalse((self.root / "out/extra.csv").exists())
+
+    def test_a_clean_pull_that_fails_partway_keeps_the_local_extras(self):
+        # The sweep used to run before the install loop, so a `_move` that
+        # raised left the artifact holding a mixture of two generations *and*
+        # the local-only files already deleted. Everything else a failed
+        # install leaves behind is one whole generation or the other and is
+        # recovered by re-running the pull; an extra is in no bucket, so it
+        # is the one thing the re-run cannot bring back.
+        for n in "abc":
+            self.write(f"out/{n}.csv", f"PUBLISHED-{n}")
+        remote, man = Fake(), Manifest({})
+        ctx = self.ctx(man, remote)
+        kinds.mirror_push(ctx, self.art())
+        for n in "abc":
+            self.write(f"out/{n}.csv", f"local-{n}")
+        self.write("out/extra.csv", "in no bucket anywhere")
+
+        real_move, moved = kinds._move, []
+
+        def failing_move(src, dest):
+            moved.append(dest.name)
+            if len(moved) == 2:                 # mid-loop, not on the first
+                raise OSError(errno.EACCES, "Permission denied")
+            return real_move(src, dest)
+
+        with unittest.mock.patch.object(kinds, "_move", failing_move):
+            with self.assertRaises(PermissionError):
+                kinds.mirror_pull(ctx, self.art(), clean=True)
+
+        self.assertEqual((self.root / "out/extra.csv").read_text(),
+                         "in no bucket anywhere")
+        # Every published file is one whole generation or the other …
+        for n in "abc":
+            self.assertIn((self.root / f"out/{n}.csv").read_text(),
+                          (f"local-{n}", f"PUBLISHED-{n}"))
+        # … and re-running the pull finishes the switch and sweeps.
+        kinds.mirror_pull(ctx, self.art(), clean=True)
+        self.assertFalse((self.root / "out/extra.csv").exists())
+        for n in "abc":
+            self.assertEqual((self.root / f"out/{n}.csv").read_text(),
+                             f"PUBLISHED-{n}")
 
     def test_pull_clean_applies_an_empty_published_mirror(self):
         # Publishing the deletion of every file is a state, not an absence:
@@ -1822,6 +1923,57 @@ class TestArchive(Base):
         self.assertEqual(remote.objects, {})
         self.assertIsNone(man.get("cache"))
 
+    def test_a_pack_race_undone_before_the_re_read_is_still_refused(self):
+        # The sibling of the test above, and the one the re-read alone could
+        # not catch: a file rewritten in place while `_pack` was reading it
+        # and put back before the second `tree_hash` leaves both hashes
+        # agreeing on bytes the bundle does not hold. The push reported
+        # success, the manifest recorded the digest of the tree of `A`, the
+        # bundle held `B`, and every reader's pull then failed for good with
+        # "the bundle is not the tree the manifest describes".
+        f = self.write("data/cache/x.json", "A" * 16)
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        real_pack = kinds._pack
+
+        def racing_pack(root, src, dest):
+            f.write_text("B" * 16)          # the build rewrites, in place …
+            real_pack(root, src, dest)
+            f.write_text("A" * 16)          # … and puts it back
+
+        before = tree_hash(self.root / "data/cache")
+        with unittest.mock.patch.object(kinds, "_pack", racing_pack):
+            with self.assertRaises(SystemExit) as e:
+                kinds.archive_push(ctx, self.art())
+
+        # The bytes are back to what they were, so only the timestamps could
+        # have told anyone — and the message has to say that rather than
+        # print the same digest twice as "was" and "now".
+        self.assertEqual(tree_hash(self.root / "data/cache"), before)
+        self.assertIn("changed while it was being packed", str(e.exception))
+        self.assertIn("bytes are back to what they were", str(e.exception))
+        self.assertNotIn("was " + before[0], str(e.exception))
+        self.assertEqual(remote.objects, {})
+        self.assertIsNone(man.get("cache"))
+
+    def test_a_push_with_nothing_to_do_takes_no_extra_walk(self):
+        # `stamps` is a whole walk of the artifact, so it belongs after the
+        # up-to-date return, not beside the `tree_hash` above it: a no-op
+        # push is the floor under `make publish` and must not pay for it.
+        for i in range(3):
+            self.write(f"data/cache/{i}.json", f'{{"n": {i}}}')
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+
+        walks = []
+        real_stamps = kinds.stamps
+        with unittest.mock.patch.object(
+                kinds, "stamps",
+                lambda root: walks.append(root) or real_stamps(root)):
+            self.assertFalse(kinds.archive_push(ctx, self.art()))
+        self.assertEqual(walks, [])
+
     def test_a_symlink_out_of_the_artifact_is_refused_at_push(self):
         # tar stores the link as a link; tree_hash reads through it. So the
         # bundle would carry a reference to a path only this machine has,
@@ -2116,6 +2268,77 @@ class TestArchive(Base):
         self.assertEqual(self._tree(), {"published.json": "published"})
         self.assertEqual([p.name for p in (self.root / "data").iterdir()],
                          ["cache"])
+
+    @unittest.skipIf(kinds.fcntl is None, "no POSIX file locks here")
+    def test_two_concurrent_installs_cannot_destroy_the_artifact(self):
+        # Two pulls of one artifact shared `.cache.litmo-old`: the second read
+        # the first's park as a dead run's leftover and deleted it, then
+        # installed into the destination the first had just vacated. The
+        # first's rename failed ENOTEMPTY, its rollback deleted the second's
+        # tree and had no park left to restore, and `data/cache` ended up
+        # absent — with the second pull having reported success.
+        self.write("data/cache/original.json", "ORIGINAL")
+        dest = self.root / "data/cache"
+        park = self.root / "data/.cache.litmo-old"
+        staged = {}
+        for tag in ("P1", "P2"):
+            s = self.root / f"stage-{tag}"
+            s.mkdir()
+            (s / f"{tag}.json").write_text(tag)
+            staged[tag] = s
+
+        real_move, parked, let_go = kinds._move, threading.Event(), threading.Event()
+
+        def move(src, d):
+            if src == staged["P1"]:     # P1 holds the lock and has parked
+                parked.set()
+                let_go.wait(10)
+            return real_move(src, d)
+
+        errors = {}
+
+        def install(tag):
+            try:
+                with kinds._installing(self.cfg, self.art()):
+                    kinds._install(staged[tag], dest, clean=True)
+            except BaseException as e:                        # noqa: BLE001
+                errors[tag] = f"{type(e).__name__}: {e}"
+
+        with unittest.mock.patch.object(kinds, "_move", move):
+            t1 = threading.Thread(target=install, args=("P1",))
+            t2 = threading.Thread(target=install, args=("P2",))
+            t1.start()
+            self.assertTrue(parked.wait(10))
+            t2.start()
+            # P2 must be waiting on the lock rather than sweeping P1's park.
+            t2.join(0.5)
+            self.assertTrue(t2.is_alive())
+            self.assertTrue(park.is_dir())
+            self.assertEqual([p.name for p in park.iterdir()],
+                             ["original.json"])
+            let_go.set()
+            t1.join(10)
+            t2.join(10)
+
+        self.assertEqual(errors, {})
+        self.assertTrue(dest.is_dir())
+        self.assertEqual(sorted(p.name for p in dest.iterdir()), ["P2.json"])
+        self.assertFalse(park.exists())
+
+    @unittest.skipIf(kinds.fcntl is None, "no POSIX file locks here")
+    def test_an_install_that_cannot_take_the_lock_refuses_rather_than_hangs(self):
+        # flock is per open file description, so a second acquisition from
+        # this same process contends exactly as another process would.
+        (self.root / "data/cache").mkdir(parents=True)
+        with kinds._installing(self.cfg, self.art()), \
+                unittest.mock.patch.object(kinds, "INSTALL_WAIT", 0.2):
+            start = time.monotonic()
+            with self.assertRaises(SystemExit) as e:
+                with kinds._installing(self.cfg, self.art()):
+                    self.fail("took a lock another install was holding")
+            self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("another litmo has been installing", str(e.exception))
+        self.assertIn("was not touched", str(e.exception))
 
     @unittest.skipUnless(OTHER_FS, "no second writable filesystem here")
     def test_a_clean_pull_onto_another_filesystem_swaps_and_rolls_back(self):
@@ -2598,6 +2821,38 @@ class TestState(Base):
 
 # --- transport --------------------------------------------------------------
 
+class Trickling:
+    """A body arriving a byte at a time, with a clock that only moves when
+    someone reads — a server sending just often enough that the socket
+    timeout never fires.
+
+    `read` raises on purpose. `_chunks` has to stream with `read1`: `read`
+    does not return until it has the whole amount asked for, so a body like
+    this spends the entire transfer inside one call and no check wrapped
+    around that call ever runs.
+    """
+
+    def __init__(self, n: int, gap: float, clock: list):
+        self.left, self.gap, self.clock = n, gap, clock
+        self.headers: dict = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n: int = -1) -> bytes:
+        raise AssertionError("_chunks must stream with read1, not read")
+
+    def read1(self, n: int = -1) -> bytes:
+        if not self.left:
+            return b""
+        self.left -= 1
+        self.clock[0] += self.gap
+        return b"A"
+
+
 class Response:
     """Enough of an HTTP response for `_drain` and `get_bytes`."""
 
@@ -2617,6 +2872,12 @@ class Response:
         out, self._body = self._body[:n], self._body[n:]
         return out
 
+    def read1(self, n: int = -1) -> bytes:
+        """One underlying read, as `http.client.HTTPResponse` has. `_chunks`
+        streams with this rather than `read`, which does not return until it
+        has the whole amount asked for."""
+        return self.read(n)
+
 
 class TestRemote(Base):
     def served(self):
@@ -2624,6 +2885,120 @@ class TestRemote(Base):
         d = Path(tempfile.mkdtemp(prefix="litmo-served-"))
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         return d, Remote(dataclasses.replace(self.cfg, base=d.as_uri()))
+
+    def test_a_body_that_trickles_is_refused_rather_than_streamed_forever(self):
+        # `TIMEOUT` bounds one socket read, not a transfer. A server sending
+        # a byte just before each one expires held a request open for as long
+        # as it cared to and nothing ever raised, so `_retrying` never got a
+        # say: measured against a real local server, `fetch_url` returned
+        # successfully after 7.96 s with the timeout set to 0.1 s.
+        clock = [0.0]
+        body = Trickling(10_000, transport.TIMEOUT, clock)
+        with unittest.mock.patch("time.monotonic", lambda: clock[0]):
+            with self.assertRaises(TimeoutError) as e:
+                list(transport._chunks(body))
+        self.assertIn("stalled", str(e.exception))
+        self.assertGreater(body.left, 0)          # it stopped, it did not run
+
+    def test_a_slow_but_real_transfer_is_not_refused(self):
+        # Why the bound is a rate and not the deadline the report asked for:
+        # what comes down this path runs from a 157 KB manifest to a 2.18 GB
+        # mirror, so a deadline short enough to catch a trickle would refuse
+        # a large download over a slow link, and one generous enough for that
+        # would catch nothing.
+        clock = [0.0]
+
+        class Slow(Trickling):
+            def read1(self, n=-1):
+                if not self.left:
+                    return b""
+                take = min(self.left, transport.MIN_RATE * 8)
+                self.left -= take
+                self.clock[0] += 1.0                    # 8 KiB a second
+                return b"A" * take
+
+        want = transport.MIN_RATE * 8 * 600             # ten minutes of it
+        body = Slow(want, 0, clock)
+        with unittest.mock.patch("time.monotonic", lambda: clock[0]):
+            got = sum(len(c) for c in transport._chunks(body))
+        self.assertEqual(got, want)
+        self.assertGreater(clock[0], transport.TIMEOUT)  # past the grace
+
+    def test_a_manifest_that_trickles_is_refused_and_costs_only_attempts(self):
+        # The manifest is the first thing every reader asks for, so a server
+        # that trickles it hangs the pull before anything else has happened.
+        # `get_bytes` reads it outside `_drain`, so it needs its own pass
+        # through `_chunks`.
+        _, remote = self.served()
+        clock, served = [0.0], []
+
+        def urlopen(req, timeout=None):
+            served.append(Trickling(10_000, transport.TIMEOUT, clock))
+            return served[-1]
+
+        with unittest.mock.patch.object(transport.urllib.request, "urlopen",
+                                        urlopen), \
+                unittest.mock.patch.object(transport, "BACKOFF", 0), \
+                unittest.mock.patch("time.monotonic", lambda: clock[0]):
+            with self.assertRaises(TimeoutError):
+                remote.get_bytes("manifest.json")
+        # A stall is transient, so it costs the attempt rather than the
+        # process — which is the outcome the socket timeout never produced.
+        self.assertEqual(len(served), transport.ATTEMPTS)
+
+    @staticmethod
+    def _rate_limited(retry_after=None, code=429):
+        h = email.message.Message()
+        if retry_after is not None:
+            h["Retry-After"] = retry_after
+        return urllib.error.HTTPError("http://x.invalid/o", code,
+                                      "Too Many Requests", h, None)
+
+    def _sleeps_for(self, err):
+        """The pauses `_retrying` chooses when every attempt raises `err`."""
+        slept = []
+        with unittest.mock.patch.object(transport.time, "sleep", slept.append):
+            with self.assertRaises(urllib.error.HTTPError):
+                transport._retrying(lambda: (_ for _ in ()).throw(err), "o")
+        return slept
+
+    def test_a_rate_limit_waits_the_window_the_server_named(self):
+        # `429` is classified transient, but the backoff was always its own:
+        # a `Retry-After: 60` got three attempts and sleeps of 0.67 s and
+        # 1.29 s — two seconds, every one of them inside the server's own
+        # exclusion window — and then failed. With eight parallel downloads
+        # that is every worker giving up during the window it was told about.
+        self.assertEqual(self._sleeps_for(self._rate_limited("60")), [60, 60])
+        self.assertEqual(self._sleeps_for(self._rate_limited("30", code=503)),
+                         [30, 30])
+
+    def test_an_http_date_retry_after_is_read_as_well_as_delta_seconds(self):
+        # RFC 9110 allows both forms and servers send both.
+        when = (datetime.datetime.now(datetime.UTC)
+                + datetime.timedelta(seconds=45))
+        asked = transport._retry_after(
+            self._rate_limited(email.utils.format_datetime(when)))
+        self.assertAlmostEqual(asked, 45, delta=2)
+
+    def test_a_retry_after_past_the_cap_is_capped_not_obeyed(self):
+        # Honouring it unbounded is the opposite mistake: an hour would be
+        # indistinguishable from a hang.
+        self.assertEqual(self._sleeps_for(self._rate_limited("3600")),
+                         [transport.RETRY_AFTER_MAX] * 2)
+
+    def test_a_useless_retry_after_leaves_the_backoff_alone(self):
+        # Zero, a date already past, and something neither form parses are
+        # no instruction at all — and taking the *greater* of the two is what
+        # stops a `Retry-After: 0` turning the retry into a hot loop.
+        past = email.utils.format_datetime(
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1))
+        for value in ("0", "-5", past, "soon please", "", None):
+            with self.subTest(value=value):
+                slept = self._sleeps_for(self._rate_limited(value))
+                self.assertEqual(len(slept), transport.ATTEMPTS - 1)
+                for pause in slept:
+                    self.assertGreater(pause, 0)
+                    self.assertLess(pause, 5)
 
     def test_object_keys_are_percent_encoded(self):
         self.assertEqual(_url("https://x.invalid/m", "out/a b#c.csv"),
@@ -3076,6 +3451,41 @@ class TestCli(Base):
             rc, _ = self.run_cli(["doctor"])
         self.assertIn("did not answer", out.getvalue())
         self.assertEqual(rc, 1)
+
+    def test_doctor_fails_a_quarto_that_is_on_path_but_does_not_run(self):
+        # `shutil.which` finding it is not the same as it working. A missing
+        # shared library, a broken wrapper or a half-finished install answers
+        # `--version` with a non-zero exit and nothing on stdout; doctor
+        # printed `quarto ` with an empty version, marked it ok and exited 0.
+        # Reproduced end to end with a stub on PATH exiting 127.
+        broken = subprocess.CompletedProcess(
+            ["quarto", "--version"], 127, stdout="",
+            stderr="quarto: error while loading shared libraries: "
+                   "libcrypto.so.3: cannot open shared object file\n")
+        out = io.StringIO()
+        with unittest.mock.patch.object(cli.shutil, "which",
+                                        lambda name: f"/usr/bin/{name}"), \
+                unittest.mock.patch.object(cli.subprocess, "run",
+                                           lambda *a, **k: broken), \
+                contextlib.redirect_stdout(out):
+            rc, _ = self.run_cli(["doctor"])
+        self.assertEqual(rc, 1)
+        self.assertIn("exited 127", out.getvalue())
+        self.assertIn("libcrypto.so.3", out.getvalue())   # why, not just that
+
+    def test_doctor_still_passes_a_quarto_that_answers(self):
+        working = subprocess.CompletedProcess(
+            ["quarto", "--version"], 0, stdout="1.5.57\n", stderr="")
+        self.write("common.mk", cli.mk_text())    # so nothing else fails it
+        out = io.StringIO()
+        with unittest.mock.patch.object(cli.shutil, "which",
+                                        lambda name: f"/usr/bin/{name}"), \
+                unittest.mock.patch.object(cli.subprocess, "run",
+                                           lambda *a, **k: working), \
+                contextlib.redirect_stdout(out):
+            rc, _ = self.run_cli(["doctor"])
+        self.assertEqual(rc, 0)
+        self.assertIn("quarto 1.5.57", out.getvalue())
 
     def test_workers_must_be_at_least_one(self):
         with self.assertRaises(SystemExit) as e:

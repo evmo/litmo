@@ -234,7 +234,20 @@ def cmd_doctor(args) -> int:
         try:
             v = subprocess.run([q, "--version"], capture_output=True,
                                text=True, timeout=QUARTO_TIMEOUT)
-            print(f"\n  quarto {v.stdout.strip()}")
+            if v.returncode:
+                # On PATH is not the same as working. A missing shared
+                # library, a broken wrapper or a half-finished install all
+                # answer `--version` with a non-zero exit and nothing on
+                # stdout, and this printed `quarto ` and exited 0 — a green
+                # doctor in front of a render that cannot start, from the one
+                # command whose whole job is to say what is wrong.
+                print(f"\n  FAIL  quarto {q} exited {v.returncode} from "
+                      f"`--version` — on PATH, but not working")
+                for line in (v.stderr or v.stdout).strip().splitlines()[:3]:
+                    print(f"          {line}")
+                ok = False
+            else:
+                print(f"\n  quarto {v.stdout.strip()}")
         except subprocess.TimeoutExpired:
             print(f"\n  FAIL  quarto {q} did not answer `--version` within "
                   f"{QUARTO_TIMEOUT}s — wedged, not missing")

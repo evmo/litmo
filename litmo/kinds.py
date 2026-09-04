@@ -23,6 +23,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import contextlib
 import errno
+import hashlib
 import json
 import mimetypes
 import os
@@ -35,9 +36,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+try:
+    import fcntl
+except ImportError:                     # a platform without POSIX locks
+    fcntl = None
+
 from . import paths
 from .config import LEGACY_STATE_DIR, STATE_DIR, state_dir
-from .hashing import file_sha256, human, tree_hash
+from .hashing import file_sha256, human, stamps, tree_hash
 from .remote import Oversized, fetch_url, head
 
 ZSTD_LEVEL = 10
@@ -67,6 +73,14 @@ MAX_OBJECT = 64 << 30
 
 # How old a leftover staging tree must be before a later run sweeps it away.
 STALE_STAGE = 24 * 3600
+
+# How long an install waits for another litmo process to finish installing the
+# same artifact. Installation is a rename, or for a merge a per-file move loop
+# — 1.2 s at 50,000 files — so a wait this long means the holder is wedged or
+# stopped rather than slow, and refusing beats hanging a pull forever. The one
+# genuinely slow case is `_move`'s cross-filesystem copy fallback, which is why
+# the refusal names the artifact rather than blaming the other process.
+INSTALL_WAIT = 300
 
 IN_SYNC, DIFFERS, LOCAL_ONLY, REMOTE_ONLY, ABSENT = (
     "in sync", "DIFFERS", "local only", "remote only", "absent")
@@ -302,8 +316,86 @@ def _discard(p: Path) -> None:
         p.unlink()
 
 
+@contextlib.contextmanager
+def _installing(cfg, art):
+    """Serialise one artifact's installation against other litmo processes.
+
+    `_swap` parks the outgoing tree beside itself under a name derived from
+    the destination, and reads an existing park as a dead run's leftover.
+    Two pulls of one artifact therefore had a window in which the second
+    deleted the first's only copy of the live tree. Reproduced with two
+    threads against the real `_swap`: the second installed its verified tree
+    while the first was still parked, the first's rename then failed
+    ENOTEMPTY, its rollback deleted the second's tree and could not restore
+    the park it no longer had, and the artifact was left absent — with the
+    second pull having reported success.
+
+    An advisory `flock` gives the park the privacy its fixed name already
+    assumes, which is what makes the "a run that was killed left it" sweep
+    inside `_swap` correct rather than a race: under the lock, a park that is
+    there belongs to nobody.
+
+    Held around installation only, not around staging. Two runs may still
+    download and verify the same bundle concurrently — installing the same
+    verified tree twice costs a rename and changes nothing — and holding it
+    across a multi-gigabyte download would serialise work that does not
+    conflict.
+
+    Bounded, because a lock nobody releases must not turn a pull into a hang.
+    The lock file lives in the state directory and is keyed on the artifact's
+    *path*: the name is a TOML table key and can be any string at all, while
+    the path is what is being protected and `config._check_layout` has
+    already proved no two artifacts share one.
+
+    Where `fcntl` is missing the install runs unserialised, exactly as it did
+    before this existed — a platform without POSIX locks is not a reason to
+    refuse to pull.
+    """
+    if fcntl is None:
+        yield
+        return
+    locks = state_dir(cfg.root) / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(art.path.as_posix().encode()).hexdigest()[:12]
+    # Never unlinked: removing a lock file races with the next process
+    # opening it, and the two would then hold different inodes and the same
+    # lock. They are empty and there is one per artifact.
+    fh = (locks / f"{art.path.name}-{key}.lock").open("a+")
+    try:
+        deadline = time.monotonic() + INSTALL_WAIT
+        said = False
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise SystemExit(
+                        f"  {art.name}: another litmo has been installing "
+                        f"{art.path} for over {INSTALL_WAIT}s — {art.path} "
+                        f"was not touched.\n"
+                        f"    Installing two copies at once can leave the "
+                        f"artifact absent, so this one stopped instead.\n"
+                        f"    Wait for it to finish, or stop it, then re-run "
+                        f"`litmo pull {art.name}`.") from None
+                if not said:
+                    print(f"  {art.name:9} waiting for another litmo to "
+                          f"finish installing {art.path} …", flush=True)
+                    said = True
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
 def _swap(staged: Path, dest: Path) -> None:
     """Replace the whole of `dest` with the verified tree.
+
+    Call it under `_installing`: the park below is named after `dest` alone,
+    so two unserialised swaps of one artifact destroy each other.
 
     The outgoing copy is parked *beside* itself, and that is the whole of the
     care taken here: a rename within one directory has no filesystem boundary
@@ -699,7 +791,8 @@ def archive_pull(ctx, art, *, force=False, clean=False) -> None:
         # merge is checked for conflicts first, so `_install` cannot fail
         # halfway through and leave a tree that is neither copy.
         try:
-            merged = _install(staged, dest, clean=clean)
+            with _installing(ctx.cfg, art):
+                merged = _install(staged, dest, clean=clean)
         except Blocked as b:
             raise _refuse_layout(
                 art, b.conflicts, ctx.cfg.root, b.why,
@@ -750,6 +843,11 @@ def archive_push(ctx, art, *, force=False, dry_run=False) -> bool:
     if remote.get("tree_hash") == digest and not force:
         print(f"  {art.name:9} up to date  ({n:,} files, {human(size)})")
         return False
+    # Compared again after packing; see the re-read below. Taken here rather
+    # than beside `tree_hash` so a push with nothing to do pays for no extra
+    # walk at all — the two are separated by a dict lookup, and anything
+    # written in that gap and left there is caught by the digest anyway.
+    stamped = stamps(src)
 
     print(f"  {art.name:9} packing     ({n:,} files, {human(size)}) …", flush=True)
     with _staging(ctx.cfg) as tmp:
@@ -786,15 +884,26 @@ def archive_push(ctx, art, *, force=False, dry_run=False) -> bool:
         # would then record a digest the bundle does not have, and every
         # reader's pull would fail on it until someone happened to push
         # again. Re-read before anything is uploaded.
+        #
+        # The re-read alone does not settle it, which is what the timestamps
+        # are for: a file rewritten in place while `_pack` was reading it and
+        # put back before this line leaves both hashes agreeing on bytes the
+        # bundle does not hold. Reproduced — manifest `tree_hash` of a tree
+        # of sixteen `A`, bundle holding sixteen `B`, push reporting success,
+        # and the reader's pull then failing for good. Same window and the
+        # same answer as `_unchanged`'s `stamp` on the mirror side.
         again, _, _ = tree_hash(src)
-        if again != digest:
+        if again != digest or stamps(src) != stamped:
             raise SystemExit(
                 f"  {art.name}: {art.path} changed while it was being "
                 f"packed — nothing was uploaded\n"
-                f"    was {digest}\n"
-                f"    now {again}\n"
-                f"    wait for whatever is writing it to finish, then "
-                f"re-run `litmo push`")
+                + (f"    was {digest}\n"
+                   f"    now {again}\n" if again != digest else
+                   "    the bytes are back to what they were, but a file "
+                   "was rewritten while the bundle was reading it, so the "
+                   "bundle holds a mixture no reader could verify\n")
+                + "    wait for whatever is writing it to finish, then "
+                  "re-run `litmo push`")
         packed = bundle.stat().st_size
         if dry_run:
             print(f"  {art.name:9} would upload {human(packed)} -> {art.key}")
@@ -922,14 +1031,33 @@ def _local_index(ctx, art, *, workers=8) -> tuple[dict[str, dict], int]:
     return idx, total
 
 
-def _unchanged(path: Path, e: dict) -> bool:
+def _unchanged(path: Path, e: dict, stamp: int | None = None) -> bool:
     """Is the file still the bytes `_local_index` hashed into `e`?
 
     Size first, because it settles nearly every real case without re-reading
     a large file.
+
+    `stamp` is `st_mtime_ns` read before something else read the file, and is
+    checked as well as the content. Content alone cannot see a write that was
+    undone. `mirror_push` uploads from the live working-tree path, and
+    `upload_file` reads that path in parts — and re-reads a part it retries —
+    so a writer rewriting the file in place between two of those reads puts
+    different generations into different parts of one object. Put the
+    original bytes back before the re-read and the re-read agrees. Reproduced
+    with two eight-byte halves: the object was `AAAAAAAABBBBBBBB` while the
+    manifest recorded the digest of sixteen `A`, and the push reported
+    success. An ordinary writer cannot restore `st_mtime_ns` as well as the
+    bytes — 200 back-to-back in-place rewrites here produced 200 distinct
+    values — so bracketing the upload with it closes the window.
+
+    Only ever grounds to refuse: nothing is accepted because of a timestamp,
+    so this can cost a push to a bare `touch` but can never publish a digest
+    the bucket does not hold.
     """
     try:
-        return (path.stat().st_size == e["size"]
+        st = path.stat()
+        return (st.st_size == e["size"]
+                and (stamp is None or st.st_mtime_ns == stamp)
                 and file_sha256(path) == e["sha256"])
     except OSError:
         return False
@@ -1095,13 +1223,26 @@ def mirror_pull(ctx, art, *, force=False, clean=False, workers=8) -> None:
                                  "Remove the path(s) named and pull again.")
 
         # Verified, and every destination can be written: from here the
-        # working tree may be changed. The layout check comes before the
-        # sweep, so a refusal costs nothing at all.
-        if clean:
-            sweep()
+        # working tree may be changed. The layout check comes before both of
+        # the steps below, so a refusal costs nothing at all.
         for _e, staged, dest in moves:
             dest.parent.mkdir(parents=True, exist_ok=True)
             _move(staged, dest)
+        # After the installs, not before. An `extra` is a local-only file —
+        # the bucket does not have it, by construction — so sweeping first
+        # and then failing partway through the loop above deleted the one
+        # thing in the artifact that re-running the pull cannot bring back.
+        # Reproduced with a three-file `--clean` pull failing EACCES on its
+        # second `_move`: `out/extra.csv` was already gone, `a.csv` held the
+        # published bytes and `b.csv`/`c.csv` the local ones. Everything a
+        # failed install leaves behind now is one whole generation or the
+        # other, and re-running the pull finishes the switch.
+        #
+        # Ordering is otherwise free: `extra` cannot name a file the loop
+        # installs, and anything standing in the loop's way was refused by
+        # `_blocked` above rather than swept out of it.
+        if clean:
+            sweep()
     print(f"  {art.name:9} {len(want):,} fetched and verified -> {art.path}")
 
 
@@ -1193,6 +1334,15 @@ def mirror_push(ctx, art, *, force=False, dry_run=False,
     def send(e: dict) -> tuple[dict, bool]:
         full = ctx.cfg.root / e["path"]
         ctype = mimetypes.guess_type(str(full))[0] or "application/octet-stream"
+        # Bracketing the upload, not just following it: the window that
+        # matters is the upload's own reads of the live path, and a rewrite
+        # undone before the re-read below is invisible to the re-read. See
+        # `_unchanged`. A file that has gone missing leaves `stamp` None and
+        # is caught by the re-read either way.
+        try:
+            stamp = full.stat().st_mtime_ns
+        except OSError:
+            stamp = None
         ctx.remote.upload(full, e["path"], ctype)
         with landed:
             sent.add(e["path"])
@@ -1201,7 +1351,7 @@ def mirror_push(ctx, art, *, force=False, dry_run=False,
         # object does not have — and every reader would then fail to
         # verify it. Re-reading the file is the only way to know that
         # the bytes which went up are the bytes being described.
-        return e, _unchanged(full, e)
+        return e, _unchanged(full, e, stamp)
 
     # One PUT is one round trip, and doing them one after another made a push
     # take as long as the bucket is far away: 200 objects at 50 ms was 10.1 s

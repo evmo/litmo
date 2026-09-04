@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import contextlib
+import datetime
+import email.utils
 import http.client
 import os
 import random
@@ -46,6 +48,38 @@ CHUNK = 1 << 20
 ATTEMPTS = 3
 BACKOFF = 0.5
 
+# The longest a `Retry-After` will be honoured. A `429` or a retryable `503`
+# is the one failure where the dependency has said how long it needs, and
+# ignoring it spent all three attempts inside the exclusion window: measured,
+# a `429` carrying `Retry-After: 60` got three attempts and sleeps of 0.67 s
+# and 1.29 s, two seconds in total, and then failed. Honouring it unbounded
+# is the opposite mistake — a server asking for an hour would look like a
+# hang — so it is capped at `TIMEOUT`, which is already how long this
+# transport will sit on a single silent socket read. Two sleeps at most, so
+# the worst case a pathological value can buy is twice that, and the retry
+# line names the wait while it happens.
+RETRY_AFTER_MAX = TIMEOUT
+
+# `TIMEOUT` above bounds one socket read, not a transfer. A server that sends
+# a byte just before each one expires holds a request open for as long as it
+# cares to, and nothing ever raises, so `_retrying` never gets a say — and
+# `read(CHUNK)` makes it worse than a loop without an elapsed check, because
+# it will not return until a whole megabyte has arrived. Measured against a
+# real local server trickling one byte every 80 ms with `TIMEOUT` at 0.1 s:
+# `fetch_url` returned *successfully* after 7.96 s, eighty times the
+# configured timeout, and that ratio is linear in how long the server keeps
+# going.
+#
+# The bound has to be a rate and not a deadline. What comes down this path
+# runs from a 157 KB manifest to a 2.18 GB mirror and a multi-gigabyte
+# `fetch`, so a total deadline short enough to catch a trickle would refuse a
+# large download over a slow link, and one generous enough for that would
+# catch nothing. A floor of a kibibyte a second is orders of magnitude under
+# any real connection and orders above a trickle. Nothing is judged until a
+# transfer has had `TIMEOUT` — as long as one socket read is already allowed
+# to take — so a slow start, a redirect or a small file never trips it.
+MIN_RATE = 1024
+
 # The `fetch` kind has no manifest, so nothing promises how big its file is —
 # unlike an archive, there is no honest number to hold the body to and refuse
 # for the lack of. A ceiling is the only bound available. It is deliberately
@@ -64,10 +98,35 @@ def _url(base: str, key: str) -> str:
     return f"{base}/{urllib.parse.quote(key, safe='/')}"
 
 
+def _chunks(reader):
+    """`reader` in single reads, giving up on one that has stalled to a
+    trickle.
+
+    `read1` rather than `read`: `read` does not come back until it has the
+    whole chunk it was asked for, so a body arriving a byte at a time spends
+    hours inside one call and no check placed around that call ever runs.
+
+    The floor is `MIN_RATE` measured over the whole transfer, and it applies
+    only after `TIMEOUT` has passed. `TimeoutError` is what `_transient`
+    already reads as worth another attempt, so a stall costs the attempt
+    rather than the process: three of them and the read fails, which is the
+    outcome the socket timeout was supposed to produce and never did.
+    """
+    started, total = time.monotonic(), 0
+    while chunk := reader.read1(CHUNK):
+        total += len(chunk)
+        elapsed = time.monotonic() - started
+        if elapsed > TIMEOUT and total / elapsed < MIN_RATE:
+            raise TimeoutError(
+                f"stalled — {total:,} bytes in {elapsed:.0f}s, under the "
+                f"{MIN_RATE:,} bytes/s this holds a transfer to")
+        yield chunk
+
+
 def _drain(reader, fh, max_bytes: int | None) -> int:
     """Copy a stream to a file, refusing to exceed `max_bytes`."""
     total = 0
-    while chunk := reader.read(CHUNK):
+    for chunk in _chunks(reader):
         total += len(chunk)
         if max_bytes is not None and total > max_bytes:
             raise Oversized(f"longer than the {max_bytes:,} bytes promised")
@@ -94,6 +153,34 @@ def _transient(e: BaseException) -> bool:
                           ssl.SSLError, http.client.IncompleteRead))
 
 
+def _retry_after(e: BaseException) -> float | None:
+    """The wait a response asked for, in seconds, or None if it did not ask.
+
+    RFC 9110 allows both forms and servers use both: delta-seconds, and an
+    HTTP-date. A date in the past, or a value neither form parses, is no
+    instruction at all and gives the caller back its own backoff.
+    """
+    headers = getattr(e, "headers", None)
+    raw = (headers.get("Retry-After") if headers is not None else None) or ""
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(int(raw)))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:                       # a date with no zone is UTC
+        when = when.replace(tzinfo=datetime.UTC)
+    now = datetime.datetime.now(datetime.UTC)
+    return max(0.0, (when - now).total_seconds())
+
+
 def _retrying(attempt, what: str):
     """Run `attempt`, retrying a transient failure with a jittered backoff.
 
@@ -109,6 +196,11 @@ def _retrying(attempt, what: str):
             if n == ATTEMPTS or not _transient(e):
                 raise
             pause = BACKOFF * 2 ** (n - 1) * (0.5 + random.random())
+            # A server that named its own recovery window knows better than
+            # this backoff does; the greater of the two, so a `Retry-After: 0`
+            # cannot turn the retry into a hot loop, and never past the cap.
+            if (asked := _retry_after(e)) is not None:
+                pause = min(max(pause, asked), RETRY_AFTER_MAX)
             print(f"    {what}: {_why(e)} — retrying in {pause:.1f}s "
                   f"({n} of {ATTEMPTS - 1})", flush=True)
             time.sleep(pause)
@@ -152,10 +244,18 @@ class Remote:
             def once():
                 with urllib.request.urlopen(_request(_url(self.cfg.base, key)),
                                             timeout=TIMEOUT) as r:
-                    body = r.read(limit + 1) if limit is not None else r.read()
-                    if limit is not None and len(body) > limit:
-                        raise Oversized(f"{key} is larger than {limit:,} bytes")
-                    return body, (r.headers.get("ETag") or "").strip('"') or None
+                    # Through `_chunks` like the streaming paths: this is the
+                    # manifest, the first thing every reader asks for, so a
+                    # server that trickles it hangs the pull before anything
+                    # else has happened.
+                    body = bytearray()
+                    for chunk in _chunks(r):
+                        body += chunk
+                        if limit is not None and len(body) > limit:
+                            raise Oversized(
+                                f"{key} is larger than {limit:,} bytes")
+                    return (bytes(body),
+                            (r.headers.get("ETag") or "").strip('"') or None)
             try:
                 return _retrying(once, key)
             except urllib.error.HTTPError as e:
