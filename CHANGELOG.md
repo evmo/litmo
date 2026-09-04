@@ -104,6 +104,39 @@ tolerated are now refused, and two commands exit differently.
   and nothing else.** `tree_hash` reads through such a directory and `tar.add`
   did not, so the two disagreed about what had been published. Found while
   testing the containment work.
+- **A merge could write outside the artifact through a symlinked parent.** A
+  bundle naming `sub/x` where the local `sub` was a link out of the tree
+  installed straight through it — the layout check waved a link on the way to
+  a file through, and the install joins its paths rather than resolving them.
+  A link below the artifact root is now a layout conflict, refused before
+  anything moves. The same escape existed one level down, in the
+  cross-filesystem fallback: `shutil.move` follows a link *at* the
+  destination where `os.replace` replaces it, so it now lands beside the
+  destination and renames.
+- **A failed `pull --clean` could destroy the local copy.** The outgoing tree
+  was renamed into the staging directory, which is then deleted — so anything
+  the second step raised left the destination absent and nothing to put back;
+  on an artifact symlinked to another filesystem it was deleted outright
+  before the copy that might fail. It is now parked beside itself, where a
+  rename has no boundary to cross, and rolled back if the install fails.
+- **An archive key could alias a mirror's objects or the manifest itself.** A
+  mirror uploads each file under its own path, so `key = "out/a.csv"` beside
+  a mirror over `out` published two different digests to one object and
+  committed a manifest no bucket could satisfy — every later archive pull
+  failed verification. Checked when `sync.toml` loads.
+- **Two things a push accepted and every pull refused.** A symlink out of the
+  artifact created *after* the preflight check, and a fifo or device node
+  anywhere in it: neither moves the tree hash, so the push exited 0, `status`
+  said in sync, and the next push said `up to date` while no reader could
+  extract the bundle. Both are refused now, the link check made against the
+  bytes going into the bundle rather than a re-read of the source.
+- **A `make -j` clone rendered while it was still syncing.** `default: sync
+  render` names prerequisites, and prerequisites are not an order, so the
+  report was built from whatever had landed — successfully. `default` and
+  `reproduce` now run their stages in order.
+- **A failed `make mk-update` truncated `common.mk` to nothing**, which
+  `include` loads happily, taking every shared target with it. Written to a
+  sibling and renamed.
 
 ### Added
 
@@ -123,6 +156,11 @@ tolerated are now refused, and two commands exit differently.
   failure.
 - Caps on archive member count and unpacked size, and on the number of bytes a
   download will accept beyond what the manifest promised.
+- An absolute ceiling on one downloaded object, applied before the transfer
+  starts. The size the manifest promises was the only bound on its own body,
+  and the manifest is the document being distrusted: an entry claiming 10^30
+  bytes streamed until the disk filled, since nothing is checked until the
+  whole body is on disk. It holds for a mirror's per-file sizes too.
 - A leftover staging tree from a pull that was killed outright — which can be
   the size of the artifact — is swept away by the next run.
 - An unreachable bucket reads as one line rather than as a traceback.
@@ -134,8 +172,10 @@ tolerated are now refused, and two commands exit differently.
 ### Changed
 
 - `common.mk`'s `clean` no longer word-splits `$(shell find …)` into `rm -rf`,
-  and refuses a `CLEAN_EXTRA` that is absolute or contains `..`. Repositories
-  vendoring it should run `make mk-update`.
+  and refuses a `CLEAN_EXTRA` that is absolute or contains `..`. `default` and
+  `reproduce` run their stages in order under `make -j`, and `mk-update`
+  cannot truncate the file it is refreshing. Repositories vendoring it should
+  run `make mk-update`.
 - `--workers` must be at least 1; 0 used to fail inside the thread pool.
 - **Mirror commands read the local tree in parallel.** Two full passes over
   every covered file used to run one file after another, either side of a

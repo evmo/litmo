@@ -55,7 +55,19 @@ CLEAN_EXTRA ?=
 .PHONY: default env sync status build render render-one preview check \
         publish reproduce clean clean-out mk-update doctor help
 
-default: sync render  ## sync, then render — what a fresh clone runs
+# `default: sync render` names two prerequisites, and prerequisites are not an
+# order: `make -j2` starts the render while the pull is still moving files
+# into out/, and the report that comes out is built from whatever had landed
+# by then — successfully, with nothing to say it happened. A sub-make per
+# stage is the portable way to write "then": the recipe lines run one after
+# another whatever -j says, while `$(MAKE)` hands the jobserver down so each
+# stage still parallelises inside itself. `.NOTPARALLEL` is the shorter
+# spelling and the wrong one — it only takes prerequisites from GNU make 4.4,
+# and every make before that (including the 3.81 Apple ships) ignores them
+# and serialises the whole file instead.
+default:  ## sync, then render — what a fresh clone runs
+	@$(MAKE) --no-print-directory sync
+	@$(MAKE) --no-print-directory render
 
 ## ---- environment --------------------------------------------------------
 # `uv sync` installs from the committed lockfile, so a second machine
@@ -105,7 +117,13 @@ preview:  ## live preview of $(DOC)
 
 ## ---- everything ---------------------------------------------------------
 
-reproduce: $(REPRODUCE)  ## the whole thing, from an empty checkout
+# In order, and one at a time, for the same reason as `default` above: the
+# stages a repo lists here are a pipeline, and `-j` would otherwise run the
+# render against half-built inputs.
+reproduce:  ## the whole thing, from an empty checkout
+	@for stage in $(REPRODUCE); do \
+	   $(MAKE) --no-print-directory $$stage || exit $$?; \
+	 done
 
 ## ---- tidying ------------------------------------------------------------
 # `clean` only removes what a render produces. Artifacts under out/ can be
@@ -131,8 +149,12 @@ endif
 
 ## ---- this file ----------------------------------------------------------
 
+# Via a sibling, because `> common.mk` truncates the file before litmo runs:
+# a missing package or a bad install then left a 0-byte common.mk, which
+# `include` loads perfectly happily, and every target in this file was gone.
 mk-update:  ## refresh common.mk from the installed litmo
-	$(LITMO) mk > common.mk
+	@$(LITMO) mk > common.mk.new || { rm -f common.mk.new; exit 1; }
+	@mv -f common.mk.new common.mk
 	@echo "common.mk refreshed — commit it"
 
 help:  ## list the targets

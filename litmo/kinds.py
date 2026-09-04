@@ -52,6 +52,19 @@ SKIP_DIRS = {"__pycache__", ".ipynb_checkpoints", ".git",
 MAX_MEMBERS = 2_000_000
 MAX_UNPACKED = 256 << 30
 
+# The ceiling on one downloaded object, applied *before* the transfer starts.
+# Every other bound on a download is the size the manifest promises, and the
+# manifest is the document being distrusted: `Manifest` accepts any
+# non-negative integer, so a corrupt or hostile bucket that says 10**30 has
+# removed the only limit on its own body and streams until the staging
+# filesystem fills — measured, 11.9 GB into staging in three seconds against
+# a server that simply never stops. An untrusted number may tighten this
+# bound; it may not remove it. Deliberately far above anything real, like
+# `remote.MAX_FETCH`: the largest archive any consumer publishes today is 65 MB
+# and the largest single mirrored file is 97 MB, so this leaves three orders
+# of magnitude, and it stays well under `MAX_UNPACKED` above.
+MAX_OBJECT = 64 << 30
+
 # How old a leftover staging tree must be before a later run sweeps it away.
 STALE_STAGE = 24 * 3600
 
@@ -170,13 +183,33 @@ def _move(src: Path, dest: Path) -> None:
     area and the destination on different filesystems, where rename is not
     allowed. The bytes have already been verified by then, so falling back to
     a copy costs the per-file atomicity and nothing else.
+
+    Not a bare `shutil.move`, though, which is not `os.replace` with a longer
+    reach: it *follows* a symlink at `dest`, moving the file into the
+    directory the link names or copying through it onto the file it names,
+    where `os.replace` replaces the link itself. `_blocked` waves a link at
+    `dest` through on exactly that promise, so on a cross-filesystem artifact
+    a merge wrote outside it — reproduced both ways, a published file
+    overwriting the target of a local link and another landing inside the
+    directory one pointed at, with the link intact and the pull reporting
+    success. Land beside `dest` on the destination's own filesystem instead,
+    then rename over it, so the fallback replaces what the rename would have.
     """
     try:
         os.replace(src, dest)
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise
-        shutil.move(str(src), str(dest))
+        near = dest.parent / f".{dest.name}.litmo-part"
+        if near.exists() or near.is_symlink():
+            _discard(near)              # a run that was killed left it
+        try:
+            shutil.move(str(src), str(near))
+        except BaseException:
+            if near.exists() or near.is_symlink():
+                _discard(near)
+            raise
+        os.replace(near, dest)
 
 
 class Blocked(Exception):
@@ -204,8 +237,16 @@ def _blocked(dest: Path, stop: Path) -> tuple[Path, str] | None:
     after. It happens whenever a published path changes between a file and a
     directory and a reader still holds the old shape.
 
-    A symlink is not in the way: `os.replace` replaces the link itself, and
-    `mkdir(exist_ok=True)` is content with a link to a directory.
+    A symlink *at* `dest` is not in the way: `os.replace` replaces the link
+    itself. A symlink on the way *to* it is another matter — `mkdir(parents=
+    True, exist_ok=True)` is content with a link to a directory and the move
+    then writes straight through it, so a bundle naming `sub/x` installs into
+    whatever `sub` points at. That is how a merge reaches outside the
+    artifact without a `..` anywhere: the paths under an artifact root are
+    joined, never resolved, because the tree they name was verified as a
+    whole. `stop` itself is exempt — `_install` has already resolved it, and
+    an artifact directory pointed at a scratch disk is a supported thing to
+    have done.
     """
     if dest.is_dir() and not dest.is_symlink():
         return (dest, "a directory here, and a file in the bucket")
@@ -217,6 +258,9 @@ def _blocked(dest: Path, stop: Path) -> tuple[Path, str] | None:
             break
         if anc.is_file():
             return (anc, "a file here, and a directory in the bucket")
+        if anc != stop and anc.is_symlink():
+            return (anc, "a symlink here, and a directory in the bucket — "
+                         "the bucket's files would land wherever it points")
         if anc == stop:
             break
     return None
@@ -250,7 +294,49 @@ def _refuse_layout(art, conflicts: list[tuple[Path, str]], root: Path,
         + f"\n    {hint}")
 
 
-def _install(staged: Path, dest: Path, attic: Path, *, clean: bool) -> bool:
+def _discard(p: Path) -> None:
+    """Remove one path, whatever shape it turned out to be."""
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+
+
+def _swap(staged: Path, dest: Path) -> None:
+    """Replace the whole of `dest` with the verified tree.
+
+    The outgoing copy is parked *beside* itself, and that is the whole of the
+    care taken here: a rename within one directory has no filesystem boundary
+    to cross, so parking always succeeds and is always undoable by renaming
+    it back. Parked into the staging directory it was neither. An artifact
+    symlinked onto another disk made that rename EXDEV, and the branch that
+    caught EXDEV deleted the outgoing tree outright *before* starting the
+    fallible cross-filesystem copy; even on one filesystem, a second step
+    that raised left the destination absent and the only copy of it inside a
+    temporary directory that was about to be removed. Either way a disk-full,
+    I/O or concurrent-layout failure during the swap destroyed the local
+    copy, on the one command whose bucket may be its only other copy.
+    """
+    parked = dest.parent / f".{dest.name}.litmo-old"
+    if parked.exists() or parked.is_symlink():
+        _discard(parked)                    # a run that was killed left it
+    outgoing = dest.exists() or dest.is_symlink()
+    if outgoing:
+        os.replace(dest, parked)
+    try:
+        _move(staged, dest)
+    except BaseException:
+        if outgoing:
+            with contextlib.suppress(OSError):
+                if dest.exists() or dest.is_symlink():
+                    _discard(dest)          # whatever the failed move left
+                os.replace(parked, dest)
+        raise
+    if outgoing and (parked.exists() or parked.is_symlink()):
+        _discard(parked)
+
+
+def _install(staged: Path, dest: Path, *, clean: bool) -> bool:
     """Move a verified staging tree onto the destination. True if it merged.
 
     A merge is the one outcome the caller cannot predict: the destination
@@ -262,33 +348,26 @@ def _install(staged: Path, dest: Path, attic: Path, *, clean: bool) -> bool:
     pointed `out/` at a scratch disk meant the artifact to live there, and a
     pull has no business quietly turning it back into an ordinary directory.
 
-    Where the whole tree is being swapped, the old one is renamed into `attic`
-    — inside the staging directory, which is about to be deleted anyway —
-    rather than removed first, so the destination is never briefly absent.
-    That swap is only ever `--clean`'s to make: it throws away whatever was
-    there, and a merge may not destroy what it did not download.
+    Where the whole tree is being swapped, `_swap` keeps the old one until
+    the new one is in place, so the destination is never briefly absent and a
+    failure puts it back. That swap is only ever `--clean`'s to make: it
+    throws away whatever was there, and a merge may not destroy what it did
+    not download.
     """
     if dest.is_symlink():
         dest = Path(os.path.realpath(dest))
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not clean and dest.exists() and dest.is_dir() != staged.is_dir():
-        # The artifact itself changed shape. Swapping would rename the local
-        # copy into the attic, which goes with the staging tree — silently,
-        # and reporting success. It is the same conflict the merge refuses
-        # per file, one level up, and it costs the whole artifact.
+        # The artifact itself changed shape. Swapping would throw the local
+        # copy away — silently, and reporting success. It is the same
+        # conflict the merge refuses per file, one level up, and it costs
+        # the whole artifact.
         raise Blocked([(dest, "a directory here, and a file in the bucket"
                               if dest.is_dir() else
                               "a file here, and a directory in the bucket")],
                       "the whole artifact would be replaced")
     if clean or not dest.exists() or dest.is_dir() != staged.is_dir():
-        if dest.exists():
-            try:
-                os.replace(dest, attic)
-            except OSError as e:
-                if e.errno != errno.EXDEV:
-                    raise
-                shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
-        _move(staged, dest)
+        _swap(staged, dest)
         return False
     if staged.is_file():
         _move(staged, dest)
@@ -310,6 +389,42 @@ def _install(staged: Path, dest: Path, attic: Path, *, clean: bool) -> bool:
 # (cached API responses, say) this is the difference between one request and
 # thousands. Identity is the hash of the *tree*, never of the bundle — see
 # hashing.tree_hash.
+
+class Escaping(Exception):
+    """A symlink out of the artifact, found in the bytes being packed."""
+
+    def __init__(self, link: str, target: Path):
+        super().__init__(link)
+        self.link, self.target = link, target
+
+
+class Special(Exception):
+    """A fifo or a device node, found in the bytes being packed."""
+
+    def __init__(self, rel: str):
+        super().__init__(rel)
+        self.rel = rel
+
+
+def _packable(mode: int) -> bool:
+    """Is a member of this kind one a reader can extract?
+
+    `tarfile.data_filter` takes regular files, directories and links; a fifo
+    or a device node it refuses with SpecialFileError, whatever the bundle
+    says. A socket never gets that far — `tarfile.gettarinfo` returns None
+    for one and `add` skips it with a debug line — so it is packable in the
+    only sense that matters here: nothing goes in, and nothing has to come
+    back out.
+    """
+    return bool(stat.S_ISREG(mode) or stat.S_ISDIR(mode)
+                or stat.S_ISLNK(mode) or stat.S_ISSOCK(mode))
+
+
+def _escapes(link: Path, root: Path) -> Path | None:
+    """Where `link` points, if that is outside `root`. None if it stays in."""
+    target = Path(os.path.realpath(link))
+    return None if target == root or root in target.parents else target
+
 
 class _Tar(tarfile.TarFile):
     """A `TarFile` that leaves owner *names* out of the member headers.
@@ -339,10 +454,17 @@ class _Tar(tarfile.TarFile):
     `DeprecationWarning` per member and an `AttributeError` in 3.16.
     """
 
+    # The artifact root, resolved, for the escaping-link check below. None
+    # when the artifact is a single file, which has nothing under it.
+    link_root: Path | None = None
+
     def gettarinfo(self, name=None, arcname=None, fileobj=None):
         if fileobj is not None or self.dereference:
             return super().gettarinfo(name, arcname, fileobj)
         st = os.lstat(name)
+        # The arcname `add` hands down is already the repo-relative path, so
+        # a refusal below can name the member the way the rest of litmo does.
+        where = str(name if arcname is None else arcname)
         if stat.S_ISREG(st.st_mode):
             if st.st_nlink > 1:              # may be a hardlink to a member
                 return super().gettarinfo(name, arcname)
@@ -350,7 +472,20 @@ class _Tar(tarfile.TarFile):
         elif stat.S_ISDIR(st.st_mode):
             kind, linkname, size = tarfile.DIRTYPE, "", 0
         elif stat.S_ISLNK(st.st_mode):
+            # The two checks below are the only ones made on the bytes that
+            # actually go into the bundle. `archive_push` refuses both kinds
+            # before it starts, but a build still running underneath the
+            # publish can create one after that, and nothing later notices:
+            # `tree_hash` reads *through* a link both times it runs, so the
+            # digest it re-checks is unchanged while tar stores a reference
+            # to a path only this machine has, and it does not count a
+            # special file at all.
+            if self.link_root is not None and (
+                    target := _escapes(Path(name), self.link_root)):
+                raise Escaping(where, target)
             kind, linkname, size = tarfile.SYMTYPE, os.readlink(name), 0
+        elif not _packable(st.st_mode):
+            raise Special(where)
         else:
             return super().gettarinfo(name, arcname)
 
@@ -376,35 +511,53 @@ def _pack(root: Path, src: Path, dest: Path) -> None:
     cctx = _zstd().ZstdCompressor(level=ZSTD_LEVEL, threads=-1)
     with dest.open("wb") as raw, cctx.stream_writer(raw) as z:
         with _Tar.open(fileobj=z, mode="w|") as tar:
+            tar.link_root = real if real.is_dir() else None
             tar.add(real, arcname=arcname)
 
 
-def _escaping_links(src: Path) -> list[tuple[Path, Path]]:
-    """Symlinks under `src` whose target is outside it.
+def _listing(art, some: list, total: int) -> str:
+    """The first few offending paths of a refusal, one to a line."""
+    return "\n".join(
+        f"    {(art.path / rel).as_posix()}" + (f" -> {t}" if t else "")
+        for rel, t in ((x if isinstance(x, tuple) else (x, None))
+                       for x in some)) + (
+        f"\n    … and {total - len(some):,} more" if total > len(some) else "")
 
-    `tar.add` stores a link *as* a link, while `tree_hash` reads *through* it
-    — so a link out of the artifact is hashed as its target's bytes but packed
-    as a reference to a path only this machine has. The push exits 0 and
-    `status` says in sync; every reader's pull then fails, because the `data`
-    extraction filter refuses a link that leaves the destination, and nothing
-    on the publisher's side ever says so. The publishing end is the only place
-    that can see the difference, so it is where this is refused.
+
+def _unpublishable(src: Path) -> tuple[list[tuple[Path, Path]], list[Path]]:
+    """Everything under `src` that a bundle cannot carry, in one walk:
+    (escaping symlinks, special files).
+
+    Both are the same failure. `tar.add` stores a link *as* a link, while
+    `tree_hash` reads *through* it — so a link out of the artifact is hashed
+    as its target's bytes but packed as a reference to a path only this
+    machine has. A fifo or a device node is not hashed at all, `tree_hash`
+    counting regular files only, but `tarfile` packs it faithfully. Either
+    way the push exits 0, `status` says in sync, and every reader's pull dies
+    on the `data` extraction filter, which refuses a link that leaves the
+    destination and refuses a special file outright. Nothing on the
+    publisher's side says so, and — because neither one moves the tree hash —
+    the *next* push says "up to date" and never repacks, so the bucket stays
+    broken until someone thinks to pass --force. The publishing end is the
+    only place that can see the difference, so it is where this is refused,
+    before the hash that would otherwise return early.
 
     A link that stays inside the artifact is fine, and stays fine: it packs,
-    extracts and hashes the same on both sides.
+    extracts and hashes the same on both sides. So is a socket, which
+    `tarfile` declines to pack at all.
     """
     root = Path(os.path.realpath(src))
     if not root.is_dir():
-        return []                      # the artifact is one file; _pack reads
+        return ([], [])                # the artifact is one file; _pack reads
                                        # through it and stores a regular file
-    out = []
+    links, special = [], []
     for p in sorted(root.rglob("*")):  # rglob does not descend through links
-        if not p.is_symlink():
-            continue
-        target = Path(os.path.realpath(p))
-        if target != root and root not in target.parents:
-            out.append((p.relative_to(root), target))
-    return out
+        if p.is_symlink():
+            if target := _escapes(p, root):
+                links.append((p.relative_to(root), target))
+        elif not _packable(p.lstat().st_mode):
+            special.append(p.relative_to(root))
+    return (links, special)
 
 
 def _unpack(archive: Path, root: Path) -> None:
@@ -474,6 +627,14 @@ def archive_pull(ctx, art, *, force=False, clean=False) -> None:
             f"{remote['key']} is, so there is no size to hold the download "
             f"to — {art.path} was not touched.\n"
             f"    `litmo push {art.name}` republishes it with one.")
+    if promised > MAX_OBJECT:
+        raise SystemExit(
+            f"  {art.name}: the manifest says {remote['key']} is "
+            f"{human(promised)}, past the {human(MAX_OBJECT)} litmo will "
+            f"download for one object — {art.path} was not touched.\n"
+            f"    Nothing is checked until the whole body is on disk, so a "
+            f"number this large is not a bound at all.\n"
+            f"    `litmo push {art.name}` republishes it with the real size.")
 
     print(f"  {art.name:9} downloading {human(promised)}"
           f" -> {art.path} ({remote.get('files', 0):,} files,"
@@ -538,7 +699,7 @@ def archive_pull(ctx, art, *, force=False, clean=False) -> None:
         # merge is checked for conflicts first, so `_install` cannot fail
         # halfway through and leave a tree that is neither copy.
         try:
-            merged = _install(staged, dest, tmp / "replaced", clean=clean)
+            merged = _install(staged, dest, clean=clean)
         except Blocked as b:
             raise _refuse_layout(
                 art, b.conflicts, ctx.cfg.root, b.why,
@@ -565,18 +726,24 @@ def archive_push(ctx, art, *, force=False, dry_run=False) -> bool:
     # Before the hash, not after: the walk is far cheaper than reading every
     # byte, and an artifact that cannot be published is worth saying so about
     # even on a push that would otherwise have found nothing to do.
-    escaping = _escaping_links(src)
+    escaping, special = _unpublishable(src)
     if escaping:
         raise SystemExit(
             f"  {art.name}: {art.path} holds {len(escaping):,} symlink(s) "
             f"pointing outside it, which pack as links no reader can follow "
             f"— nothing was uploaded:\n"
-            + "\n".join(f"    {(art.path / rel).as_posix()} -> {t}"
-                        for rel, t in escaping[:10])
-            + (f"\n    … and {len(escaping) - 10:,} more"
-               if len(escaping) > 10 else "")
+            + _listing(art, escaping[:10], len(escaping))
             + f"\n    Replace them with the files themselves, or move the "
               f"targets inside {art.path}, then re-run `litmo push`.")
+    if special:
+        raise SystemExit(
+            f"  {art.name}: {art.path} holds {len(special):,} file(s) that "
+            f"are not files — a fifo or a device node packs into the bundle "
+            f"and is then refused by every reader's extraction filter, while "
+            f"`tree_hash` never counted it, so nothing else would ever have "
+            f"said so — nothing was uploaded:\n"
+            + _listing(art, special[:10], len(special))
+            + f"\n    Remove them from {art.path}, then re-run `litmo push`.")
 
     digest, n, size = tree_hash(src)
     remote = _prior(ctx, art)
@@ -587,7 +754,32 @@ def archive_push(ctx, art, *, force=False, dry_run=False) -> bool:
     print(f"  {art.name:9} packing     ({n:,} files, {human(size)}) …", flush=True)
     with _staging(ctx.cfg) as tmp:
         bundle = Path(tmp) / f"{art.name}.tar.zst"
-        _pack(ctx.cfg.root, src, bundle)
+        try:
+            _pack(ctx.cfg.root, src, bundle)
+        except Special as e:
+            raise SystemExit(
+                f"  {art.name}: {paths.display(e.rel)} became a fifo or a "
+                f"device node while {art.path} was being packed — nothing "
+                f"was uploaded\n"
+                f"    No reader can extract one: the `data` filter refuses it "
+                f"outright. And `tree_hash` does not count it, so the digest "
+                f"re-checked below would have agreed and the next push would "
+                f"have said `up to date`.\n"
+                f"    Wait for whatever is writing {art.path} to finish, then "
+                f"re-run `litmo push`.") from None
+        except Escaping as e:
+            raise SystemExit(
+                f"  {art.name}: {paths.display(e.link)}"
+                f" became a symlink "
+                f"pointing outside {art.path} while it was being packed — "
+                f"nothing was uploaded\n"
+                f"    -> {paths.display(e.target)}\n"
+                f"    A bundle carrying it is one no reader can extract, and "
+                f"nothing after this point would have noticed: `tree_hash` "
+                f"reads through a link, so the digest re-checked below is the "
+                f"target's bytes either way.\n"
+                f"    Wait for whatever is writing {art.path} to finish, then "
+                f"re-run `litmo push`.") from None
         # `tree_hash` and `_pack` read the tree independently, and packing a
         # large one takes a while — long enough for a build still running
         # underneath the publish to put different bytes in each. The manifest
@@ -837,6 +1029,21 @@ def mirror_pull(ctx, art, *, force=False, clean=False, workers=8) -> None:
         left = len(local) - len(extra) if clean else len(local)
         print(f"  {art.name:9} up to date  ({left:,} files)")
         return
+    # The same promise, and the same reason to distrust it: each file's only
+    # bound is the size the manifest gives it, so one entry claiming an
+    # absurd number streams until the disk fills before a digest is looked at.
+    if huge := [e for e in want if e["size"] > MAX_OBJECT]:
+        raise SystemExit(
+            f"  {art.name}: the manifest says {huge[0]['path']} is "
+            f"{human(huge[0]['size'])}, past the {human(MAX_OBJECT)} litmo "
+            f"will download for one object — nothing under {art.path} was "
+            f"changed.\n"
+            + (f"    … and {len(huge) - 1:,} more like it\n"
+               if len(huge) > 1 else "")
+            + "    Nothing is checked until the whole body is on disk, so a "
+              "number this large is not a bound at all.\n"
+            + f"    `litmo push {art.name}` republishes it with the real "
+              f"sizes.")
     print(f"  {art.name:9} downloading {len(want):,} of {len(remote):,} files"
           f"  ({human(sum(e['size'] for e in want))})", flush=True)
 

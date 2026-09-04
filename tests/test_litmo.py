@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import http.client
 import io
 import json
 import os
 import shutil
+import socket
+import subprocess
 import tarfile
 import tempfile
 import threading
@@ -54,6 +57,37 @@ include = [".csv", ".json"]
 # Stand-ins that are the right *shape*: the manifest reader rejects a digest
 # that is not 64 hex characters, so fixtures cannot use "aa" any more.
 H1, H2, H3 = "1" * 64, "2" * 64, "3" * 64
+
+
+def _other_filesystem():
+    """A writable directory on a different filesystem from the temporary one,
+    for the tests that need a real EXDEV rather than an injected one."""
+    here = os.stat(tempfile.gettempdir()).st_dev
+    for cand in ("/dev/shm", f"/run/user/{os.getuid()}",
+                 os.path.expanduser("~")):
+        try:
+            if os.stat(cand).st_dev != here and os.access(cand, os.W_OK):
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+OTHER_FS = _other_filesystem()
+
+
+def _gnu_make() -> bool:
+    """`make -j` ordering is only meaningful against a make that has -j and
+    the recursive-line rule — every GNU one does, BSD's does not."""
+    try:
+        out = subprocess.run(["make", "--version"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "GNU Make" in out
+
+
+GNU_MAKE = _gnu_make()
 
 
 class Fake:
@@ -237,6 +271,37 @@ class TestConfig(Base):
                         '\n[artifact.other]\nkind = "archive"\n'
                         'path = "data/other"\nkey = "v1/data-cache.tar.zst"\n')
         self.assertIn("both publish to key", str(e.exception))
+
+    def test_an_archive_key_may_not_land_in_a_mirrors_namespace(self):
+        # A mirror uploads each file to its own repo-relative path, so `out`
+        # claims every key under `out/`. An archive aimed at one of them made
+        # both push and the manifest commit succeed while the bucket could
+        # only ever hold one of the two digests the manifest then named.
+        for bad in ("out/a.csv", "out", "out/deep/bundle.tar.zst"):
+            with self.subTest(bad), self.assertRaises(SystemExit) as e:
+                self.reload(SYNC_TOML.replace("v1/data-cache.tar.zst", bad))
+            self.assertIn("inside what mirror 'out' publishes",
+                          str(e.exception))
+
+    def test_a_key_that_merely_starts_like_a_mirrors_path_is_fine(self):
+        cfg = self.reload(SYNC_TOML.replace("v1/data-cache.tar.zst",
+                                            "outer/bundle.tar.zst"))
+        self.assertEqual({a.name: a.key for a in cfg.artifacts}["cache"],
+                         "outer/bundle.tar.zst")
+
+    def test_an_archive_key_may_not_be_the_manifests_own_object(self):
+        with self.assertRaises(SystemExit) as e:
+            self.reload(SYNC_TOML.replace("v1/data-cache.tar.zst",
+                                          "manifest.json"))
+        self.assertIn("the manifest's own object", str(e.exception))
+
+    def test_the_manifest_key_may_not_land_in_a_mirrors_namespace(self):
+        with self.assertRaises(SystemExit) as e:
+            self.reload(SYNC_TOML.replace(
+                'base = "https://example.invalid/mirror"',
+                'base = "https://example.invalid/mirror"\n'
+                'manifest = "out/manifest.json"'))
+        self.assertIn("overwrite the manifest", str(e.exception))
 
     def test_fetch_url_must_be_http(self):
         with self.assertRaises(SystemExit):
@@ -751,6 +816,26 @@ class TestMirror(Base):
         self.write("out/only.txt", "not included")
         self.assertTrue(kinds.mirror_push(ctx, self.art()))
         self.assertEqual(man.mirror_files("out"), [])
+
+    def test_a_mirrored_file_past_the_ceiling_is_refused_before_the_transfer(self):
+        # Same promise, same reason to distrust it: a mirror file's only bound
+        # is the size the manifest gives it.
+        self.write("out/a.csv", "x,y\n")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.mirror_push(ctx, self.art())
+        entry = dict(man.get("out"))
+        entry["files"] = [dict(f, size=10 ** 30) for f in entry["files"]]
+        man.set("out", entry)
+        (self.root / "out/a.csv").unlink()
+
+        asked = []
+        remote.download_many = lambda jobs, **kw: asked.extend(jobs)
+        with self.assertRaises(SystemExit) as e:
+            kinds.mirror_pull(ctx, self.art())
+        self.assertIn("past the", str(e.exception))
+        self.assertIn("nothing under out was changed", str(e.exception))
+        self.assertEqual(asked, [])
 
     def test_pull_verifies_checksums(self):
         self.write("out/a.csv", "hello")
@@ -1772,6 +1857,130 @@ class TestArchive(Base):
             kinds.archive_push(ctx, self.art())
         self.assertIn("data/cache/sub", str(e.exception))
 
+    def test_a_fifo_in_the_artifact_is_refused_at_push(self):
+        # tree_hash counts regular files only, so a fifo never moves the
+        # digest — while tarfile packs it faithfully and every reader's
+        # extraction filter then refuses the whole bundle. The push used to
+        # exit 0 reporting "1 files" and status said in sync; worse, the next
+        # push said "up to date" and never repacked, so the bucket stayed
+        # unreadable until someone passed --force.
+        self.write("data/cache/1.json", "{}")
+        os.mkfifo(self.root / "data/cache/pipe")
+
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        with self.assertRaises(SystemExit) as e:
+            kinds.archive_push(ctx, self.art())
+        self.assertIn("file(s) that are not files", str(e.exception))
+        self.assertIn("data/cache/pipe", str(e.exception))
+        self.assertEqual(remote.objects, {})
+        self.assertIsNone(man.get("cache"))
+
+    def test_the_refusal_survives_a_bucket_that_is_already_up_to_date(self):
+        # The check has to come before the tree-hash early return, or the one
+        # publisher who could fix a broken bucket is told nothing.
+        self.write("data/cache/1.json", "{}")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+        os.mkfifo(self.root / "data/cache/pipe")
+
+        with self.assertRaises(SystemExit) as e:
+            kinds.archive_push(ctx, self.art())
+        self.assertIn("data/cache/pipe", str(e.exception))
+
+    def test_a_fifo_that_appears_while_packing_is_refused(self):
+        self.write("data/cache/1.json", "{}")
+        real_check = kinds._unpublishable
+
+        def racing_check(src):
+            out = real_check(src)
+            os.mkfifo(self.root / "data/cache/pipe")
+            return out
+
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        with unittest.mock.patch.object(kinds, "_unpublishable", racing_check):
+            with self.assertRaises(SystemExit) as e:
+                kinds.archive_push(ctx, self.art())
+        self.assertIn("data/cache/pipe became a fifo", str(e.exception))
+        self.assertEqual(remote.objects, {})
+
+    def test_a_socket_is_not_a_special_file_this_has_to_refuse(self):
+        # tarfile declines to pack a socket at all, so nothing goes into the
+        # bundle and nothing has to come back out. Refusing it too would
+        # block a push that works today.
+        self.write("data/cache/1.json", "{}")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(sock.close)
+        sock.bind(str(self.root / "data/cache/sock"))
+        self.assertTrue((self.root / "data/cache/sock").is_socket())
+
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.assertTrue(kinds.archive_push(ctx, self.art()))
+        shutil.rmtree(self.root / "data/cache")
+        kinds.archive_pull(ctx, self.art())
+        self.assertEqual((self.root / "data/cache/1.json").read_text(), "{}")
+
+    def test_a_symlink_that_appears_while_packing_is_refused(self):
+        # The preflight check runs once, before the hash. A build still
+        # running underneath the publish can replace a regular file with an
+        # external link after it, and nothing downstream sees the difference:
+        # tree_hash reads *through* the link both times, so the race re-read
+        # agrees with itself while tar stores a reference to a path only this
+        # machine has. Push exited 0, status said in sync, and every reader
+        # got AbsoluteLinkError.
+        outside = Path(tempfile.mkdtemp(prefix="litmo-outside-")).resolve()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "big.bin").write_text("someone else's bytes")
+        self.write("data/cache/1.json", "{}")
+        self.write("data/cache/big.bin", "someone else's bytes")
+
+        real_check = kinds._unpublishable
+
+        def racing_check(src):
+            out = real_check(src)              # the check itself is honest …
+            p = self.root / "data/cache/big.bin"   # … the build lands after it
+            p.unlink()
+            p.symlink_to(outside / "big.bin")
+            return out
+
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        with unittest.mock.patch.object(kinds, "_unpublishable", racing_check):
+            with self.assertRaises(SystemExit) as e:
+                kinds.archive_push(ctx, self.art())
+        self.assertIn("data/cache/big.bin became a symlink", str(e.exception))
+        self.assertIn("nothing was uploaded", str(e.exception))
+        self.assertEqual(remote.objects, {})
+        self.assertIsNone(man.get("cache"))
+
+    def test_a_directory_symlink_that_appears_while_packing_is_refused_too(self):
+        outside = Path(tempfile.mkdtemp(prefix="litmo-outside-")).resolve()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "x.json").write_text("{}")
+        self.write("data/cache/1.json", "{}")
+        self.write("data/cache/sub/x.json", "{}")
+
+        real_check = kinds._unpublishable
+
+        def racing_check(src):
+            out = real_check(src)
+            shutil.rmtree(self.root / "data/cache/sub")
+            (self.root / "data/cache/sub").symlink_to(outside)
+            return out
+
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        with unittest.mock.patch.object(kinds, "_unpublishable", racing_check):
+            with self.assertRaises(SystemExit) as e:
+                kinds.archive_push(ctx, self.art())
+        self.assertIn("data/cache/sub became a symlink", str(e.exception))
+        self.assertEqual(remote.objects, {})
+
     def test_a_symlink_inside_the_artifact_still_round_trips(self):
         self.write("data/cache/real.json", "{}")
         (self.root / "data/cache/link.json").symlink_to("real.json")
@@ -1858,6 +2067,194 @@ class TestArchive(Base):
         self.assertEqual((self.root / "data/cache/mine.json").read_text(),
                          "irreplaceable local tree")
 
+    def _diverged_clean_pull(self):
+        """Publish a tree, then let the local copy diverge. Returns (ctx, art
+        callable's ctx) with a `--clean` pull left to do."""
+        self.write("data/cache/published.json", "published")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+        self.write("data/cache/published.json", "irreplaceable local edit")
+        self.write("data/cache/only-here.json", "also irreplaceable")
+        return ctx
+
+    def _tree(self):
+        d = self.root / "data/cache"
+        return {p.relative_to(d).as_posix(): p.read_text()
+                for p in sorted(d.rglob("*")) if p.is_file()}
+
+    def test_a_clean_pull_whose_install_fails_keeps_the_previous_tree(self):
+        # The swap is two steps, and everything the second one can raise —
+        # ENOSPC, EIO, a concurrent layout change, a cross-filesystem copy
+        # that dies partway — used to arrive after the old tree had already
+        # been renamed into the staging directory, which is then deleted.
+        ctx = self._diverged_clean_pull()
+        before = self._tree()
+
+        real_move = kinds._move
+
+        def failing_move(src, dest):
+            if src.name == "cache":            # the staged tree -> destination
+                raise OSError(errno.EIO, "I/O error")
+            return real_move(src, dest)
+
+        with unittest.mock.patch.object(kinds, "_move", failing_move):
+            with self.assertRaises(OSError):
+                kinds.archive_pull(ctx, self.art(), clean=True)
+
+        self.assertEqual(self._tree(), before)
+        self.assertEqual([p.name for p in (self.root / "data").iterdir()],
+                         ["cache"])           # nothing parked left behind
+
+    def test_a_clean_pull_sweeps_a_park_a_killed_run_left_behind(self):
+        ctx = self._diverged_clean_pull()
+        stale = self.root / "data/.cache.litmo-old"
+        stale.mkdir()
+        (stale / "from-a-dead-run.json").write_text("{}")
+
+        kinds.archive_pull(ctx, self.art(), clean=True)
+        self.assertEqual(self._tree(), {"published.json": "published"})
+        self.assertEqual([p.name for p in (self.root / "data").iterdir()],
+                         ["cache"])
+
+    @unittest.skipUnless(OTHER_FS, "no second writable filesystem here")
+    def test_a_clean_pull_onto_another_filesystem_swaps_and_rolls_back(self):
+        # The artifact directory symlinked onto a scratch disk is the case
+        # that made the park itself EXDEV. Nothing may cross a filesystem
+        # boundary before the new tree is in place.
+        elsewhere = Path(tempfile.mkdtemp(prefix="litmo-fs-", dir=OTHER_FS))
+        parked = elsewhere.parent / f".{elsewhere.name}.litmo-old"
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, parked, ignore_errors=True)
+        (self.root / "data").mkdir()
+        (self.root / "data/cache").symlink_to(elsewhere)
+        ctx = self._diverged_clean_pull()
+        self.assertNotEqual(os.stat(self.root).st_dev, os.stat(elsewhere).st_dev)
+        before = self._tree()
+
+        def failing_copy(src, dst):            # the cross-filesystem fallback
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with unittest.mock.patch.object(shutil, "move", failing_copy):
+            with self.assertRaises(OSError):
+                kinds.archive_pull(ctx, self.art(), clean=True)
+        self.assertTrue((self.root / "data/cache").is_symlink())
+        self.assertEqual(self._tree(), before)
+
+        kinds.archive_pull(ctx, self.art(), clean=True)
+        self.assertEqual(self._tree(), {"published.json": "published"})
+        self.assertTrue((self.root / "data/cache").is_symlink())
+        self.assertFalse(parked.exists())
+
+    def _published_over_a_symlinked_subdirectory(self):
+        """Publish `sub/x`, then make the reader's `sub` a link out of the
+        artifact. Returns (ctx, outside)."""
+        outside = Path(tempfile.mkdtemp(prefix="litmo-outside-")).resolve()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        self.write("data/cache/sub/x", "FROM THE BUCKET")
+        self.write("data/cache/keep.json", "published")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+
+        (outside / "x").write_text("irreplaceable")
+        shutil.rmtree(self.root / "data/cache/sub")
+        (self.root / "data/cache/sub").symlink_to(outside)
+        self.write("data/cache/keep.json", "local")     # so it is a real merge
+        return ctx, outside
+
+    def test_a_merge_may_not_write_through_a_symlinked_parent(self):
+        # `sub` is a link out of the artifact, and the bundle holds `sub/x`.
+        # The merge joins its paths rather than resolving them, so without a
+        # check here mkdir(exist_ok=True) accepts the link and the move writes
+        # straight through it — outside the artifact, reporting success.
+        ctx, outside = self._published_over_a_symlinked_subdirectory()
+
+        with self.assertRaises(SystemExit) as e:
+            kinds.archive_pull(ctx, self.art())
+        self.assertIn("data/cache was not touched", str(e.exception))
+        self.assertIn("data/cache/sub is a symlink here", str(e.exception))
+        self.assertEqual((outside / "x").read_text(), "irreplaceable")
+        self.assertEqual((self.root / "data/cache/keep.json").read_text(),
+                         "local")
+
+    def test_the_clean_pull_that_refusal_advises_stays_inside_too(self):
+        # The refusal above says to re-run with --clean, so --clean must
+        # actually be safe: it renames the whole local tree away, taking the
+        # link with it, and never follows it.
+        ctx, outside = self._published_over_a_symlinked_subdirectory()
+
+        kinds.archive_pull(ctx, self.art(), clean=True)
+        self.assertEqual((outside / "x").read_text(), "irreplaceable")
+        self.assertFalse((self.root / "data/cache/sub").is_symlink())
+        self.assertEqual((self.root / "data/cache/sub/x").read_text(),
+                         "FROM THE BUCKET")
+
+    @unittest.skipUnless(OTHER_FS, "no second writable filesystem here")
+    def test_a_cross_filesystem_merge_replaces_a_symlink_rather_than_following(self):
+        # `_blocked` lets a symlink AT the destination through, because
+        # os.replace replaces the link itself. The cross-filesystem fallback
+        # was not os.replace: shutil.move follows the link — into the
+        # directory it names, or through it onto the file it names — so a
+        # merge onto an artifact symlinked to another disk wrote outside it
+        # and reported success.
+        elsewhere = Path(tempfile.mkdtemp(prefix="litmo-fs-", dir=OTHER_FS))
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        (self.root / "data").mkdir()
+        (self.root / "data/cache").symlink_to(elsewhere)
+        self.assertNotEqual(os.stat(self.root).st_dev, os.stat(elsewhere).st_dev)
+
+        self.write("data/cache/keep.json", "published")
+        self.write("data/cache/onto-a-file", "FROM THE BUCKET")
+        self.write("data/cache/onto-a-dir", "FROM THE BUCKET")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+
+        outside = Path(tempfile.mkdtemp(prefix="litmo-outside-")).resolve()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "victim").write_text("irreplaceable")
+        (outside / "sub").mkdir()
+        for name, target in (("onto-a-file", "victim"), ("onto-a-dir", "sub")):
+            (elsewhere / name).unlink()
+            (elsewhere / name).symlink_to(outside / target)
+        self.write("data/cache/keep.json", "local")     # so it is a merge
+
+        kinds.archive_pull(ctx, self.art())
+        self.assertEqual((outside / "victim").read_text(), "irreplaceable")
+        self.assertEqual(list((outside / "sub").iterdir()), [])
+        for name in ("onto-a-file", "onto-a-dir"):
+            self.assertFalse((elsewhere / name).is_symlink())
+            self.assertEqual((elsewhere / name).read_text(), "FROM THE BUCKET")
+        self.assertEqual([p.name for p in elsewhere.iterdir()
+                          if p.name.endswith(".litmo-part")], [])
+
+    def test_a_merge_still_replaces_a_symlink_it_publishes_over(self):
+        # The guard is about links on the way *to* a file, not at it: a
+        # published `link.json` where a link sits locally is replaced, and an
+        # untouched symlinked subdirectory the bundle names nothing under is
+        # nobody's business.
+        self.write("data/cache/real.json", "published")
+        self.write("data/cache/link.json", "published")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+
+        outside = Path(tempfile.mkdtemp(prefix="litmo-outside-")).resolve()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "untouched").write_text("mine")
+        (self.root / "data/cache/link.json").unlink()
+        (self.root / "data/cache/link.json").symlink_to(outside / "untouched")
+        (self.root / "data/cache/spare").symlink_to(outside)
+        self.write("data/cache/real.json", "local")
+
+        kinds.archive_pull(ctx, self.art())
+        self.assertFalse((self.root / "data/cache/link.json").is_symlink())
+        self.assertEqual((self.root / "data/cache/link.json").read_text(),
+                         "published")
+        self.assertEqual((outside / "untouched").read_text(), "mine")
+        self.assertTrue((self.root / "data/cache/spare").is_symlink())
+
     def test_clean_pull_replaces_a_conflicting_shape_outright(self):
         # --clean swaps the whole tree rather than merging into it, so it has
         # no per-file conflict to hit and must keep working.
@@ -1929,6 +2326,28 @@ class TestArchive(Base):
         self.assertGreater(promised, 0)
         kinds.archive_pull(ctx, self.art(), force=True)
         self.assertEqual(caps, [promised])          # not None
+
+    def test_an_archive_size_past_the_ceiling_is_refused_before_the_transfer(self):
+        # The promise is the download's only bound, and the manifest is the
+        # document being distrusted — Manifest takes any non-negative integer.
+        # Measured against a server that never stops: 11.9 GB into staging in
+        # three seconds with archive_bytes = 10**30. So the promise may
+        # tighten the ceiling; it may not remove it.
+        self.write("data/cache/1.json", "{}")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+        entry = dict(man.get("cache"))
+        entry["archive_bytes"] = 10 ** 30
+        man.set("cache", entry)
+
+        asked = []
+        remote.download = lambda k, d, m=None: asked.append(k)
+        with self.assertRaises(SystemExit) as e:
+            kinds.archive_pull(ctx, self.art(), force=True)
+        self.assertIn("past the", str(e.exception))
+        self.assertIn("data/cache was not touched", str(e.exception))
+        self.assertEqual(asked, [])            # nothing was ever requested
 
     def test_an_archive_entry_promising_zero_bytes_is_refused(self):
         ctx, man, caps = self._published()
@@ -2780,6 +3199,77 @@ class TestSharedMakefile(Base):
         os.chdir(self.root)
         self.addCleanup(os.chdir, here)
         self.assertIn("GENERATED by `litmo mk`", self.mk())
+
+    def _make_sandbox(self):
+        """A consumer-shaped checkout: the packaged common.mk, a Makefile that
+        includes it, and stub `litmo`/`quarto` that log when they run."""
+        d = self.root / "consumer"
+        (d / "bin").mkdir(parents=True)
+        (d / "reports").mkdir()
+        (d / "reports/r.qmd").write_text("")
+        (d / "common.mk").write_text(self.packaged.read_text(encoding="utf-8"))
+        (d / "Makefile").write_text("include common.mk\nbuild:\n"
+                                    "\t@echo BUILD >> $(LOG)\ncheck:\n\t@true\n")
+        log = d / "log"
+        for name, body in (("litmo", "echo SYNC_STARTED >> %s\nsleep 1\n"
+                                     "echo SYNC_COMPLETE >> %s\n"),
+                           ("quarto", "echo RENDER_STARTED >> %s\n"
+                                      "echo RENDER_COMPLETE >> %s\n")):
+            p = d / "bin" / name
+            p.write_text("#!/bin/sh\n" + body % (log, log))
+            p.chmod(0o755)
+        return d, log
+
+    def _run_make(self, d, *args, expect=0):
+        env = dict(os.environ, PATH=f"{d / 'bin'}:{os.environ['PATH']}")
+        r = subprocess.run(["make", "-j4", "UV=", f"LOG={d / 'log'}", *args],
+                           cwd=d, env=env, capture_output=True, text=True,
+                           timeout=120)
+        self.assertEqual(r.returncode, expect, r.stdout + r.stderr)
+        if expect or not (d / "log").exists():
+            return r
+        return (d / "log").read_text().split()
+
+    @unittest.skipUnless(GNU_MAKE, "GNU make is not on this PATH")
+    def test_a_failed_mk_update_leaves_the_working_common_mk_alone(self):
+        # `litmo mk > common.mk` truncates the file before litmo runs, so a
+        # missing package or a bad install left a 0-byte common.mk — which
+        # `include` loads perfectly happily, taking every shared target with
+        # it. Nothing after that point could tell you why.
+        d, _ = self._make_sandbox()
+        before = (d / "common.mk").read_text()
+        (d / "bin/litmo").write_text(
+            '#!/bin/sh\n[ "$1" = mk ] && { echo "boom" >&2; exit 1; }\n')
+        (d / "bin/litmo").chmod(0o755)
+
+        self._run_make(d, "mk-update", expect=2)
+        self.assertEqual((d / "common.mk").read_text(), before)
+        self.assertFalse((d / "common.mk.new").exists())
+
+        (d / "bin/litmo").write_text(
+            '#!/bin/sh\n[ "$1" = mk ] && { echo "# regenerated"; exit 0; }\n')
+        (d / "bin/litmo").chmod(0o755)
+        self._run_make(d, "mk-update", expect=0)
+        self.assertEqual((d / "common.mk").read_text(), "# regenerated\n")
+        self.assertFalse((d / "common.mk.new").exists())
+
+    @unittest.skipUnless(GNU_MAKE, "GNU make is not on this PATH")
+    def test_the_ordered_targets_stay_ordered_under_parallel_make(self):
+        # `default: sync render` and `reproduce: $(REPRODUCE)` named
+        # prerequisites, and prerequisites are not an order: `make -j` started
+        # the render while the pull was still moving files into out/, and the
+        # report it produced from whatever had landed exited 0 with nothing to
+        # say it had happened.
+        d, _ = self._make_sandbox()
+        self.assertEqual(self._run_make(d, "default"),
+                         ["SYNC_STARTED", "SYNC_COMPLETE",
+                          "RENDER_STARTED", "RENDER_COMPLETE"])
+
+        (d / "log").unlink()
+        self.assertEqual(
+            self._run_make(d, "REPRODUCE=sync build render", "reproduce"),
+            ["SYNC_STARTED", "SYNC_COMPLETE", "BUILD",
+             "RENDER_STARTED", "RENDER_COMPLETE"])
 
     def doctor_says(self) -> str:
         """The one `doctor` line about the vendored common.mk."""

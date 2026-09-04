@@ -173,13 +173,25 @@ def _include(raw, name: str) -> tuple[str, ...]:
     return tuple(raw)
 
 
-def _check_layout(arts: list[Artifact]) -> None:
-    """No artifact may contain another, and no two archives may share a key.
+def _check_layout(arts: list[Artifact], manifest_key: str) -> None:
+    """No artifact may contain another, and no two things may write one key.
 
     Overlap is never what someone meant: a mirror over `out` would sweep up a
     `fetch` landing in `out/`, publish it, and delete it again on the next
     `pull --clean`. Two archives sharing a key would each overwrite the other
     on every push.
+
+    Keys collide in a quieter way, because the two sides of a collision are
+    written by different code. An archive PUTs its bundle to one key it names
+    outright; a mirror PUTs each of its files to the file's own repo-relative
+    path, so the keys it claims are its `path` and everything under it; and
+    the manifest is committed to a key of its own. Nothing compared the three,
+    so `key = "out/a.csv"` beside a mirror over `out` uploaded a bundle and
+    then a CSV to one object, and `push` exited 0 having committed a manifest
+    that named a different digest for each — an impossible document, and every
+    reader's archive pull failing verification against it ever after. An
+    archive or a mirror aimed at the manifest's own key is the same collision
+    with the one object a reader has to be able to read at all.
     """
     for i, a in enumerate(arts):
         for b in arts[i + 1:]:
@@ -196,6 +208,33 @@ def _check_layout(arts: list[Artifact]) -> None:
                 raise SystemExit(f"artifacts {keys[a.key]!r} and {a.name!r} "
                                  f"both publish to key {a.key!r}")
             keys[a.key] = a.name
+
+    mirrors = [a for a in arts if a.kind == "mirror"]
+
+    def claimed_by(key: str) -> Artifact | None:
+        """The mirror that would upload one of its own files to `key`."""
+        return next((m for m in mirrors
+                     if paths.is_under(key, m.path.as_posix())), None)
+
+    for a in arts:
+        if a.kind != "archive":
+            continue
+        if a.key == manifest_key:
+            raise SystemExit(
+                f"artifact {a.name!r} publishes its bundle to key {a.key!r}, "
+                f"which is the manifest's own object — a push would leave the "
+                f"bucket holding one or the other, never both")
+        if m := claimed_by(a.key):
+            raise SystemExit(
+                f"artifact {a.name!r} publishes its bundle to key {a.key!r}, "
+                f"which is inside what mirror {m.name!r} publishes "
+                f"({m.path.as_posix()}/) — the two would overwrite each other "
+                f"and the manifest would name a digest for each")
+    if m := claimed_by(manifest_key):
+        raise SystemExit(
+            f"[remote] manifest is {manifest_key!r}, which is inside what "
+            f"mirror {m.name!r} publishes ({m.path.as_posix()}/) — a push "
+            f"would overwrite the manifest with one of that artifact's files")
 
 
 def load(root: Path | None = None) -> Config:
@@ -249,13 +288,12 @@ def load(root: Path | None = None) -> Config:
 
     if not arts:
         raise SystemExit(f"{root / CONFIG_NAME} declares no [artifact.*]")
-    _check_layout(arts)
-
     manifest_key = remote.get("manifest", "manifest.json")
     try:
         paths.relative(manifest_key, what="[remote] manifest")
     except paths.Unsafe as e:
         raise SystemExit(str(e)) from None
+    _check_layout(arts, manifest_key)
 
     # A `fetch` url is checked for its scheme (above); `base` was not, though
     # it is the larger trust boundary of the two — the manifest and every
