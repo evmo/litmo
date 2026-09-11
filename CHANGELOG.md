@@ -44,6 +44,19 @@ tolerated are now refused, and two commands exit differently.
   path was already retried ten times by botocore; this is the other half of
   that.
 
+- **A truncated HTTP body was accepted as a complete download.** The read
+  loop streams with `read1`, which answers a finished body and a connection
+  that went away mid-transfer identically — with an empty chunk — so a
+  response that stopped short of the `Content-Length` it declared came back
+  as a successful read. Measured against a real `HTTPResponse`: a 15-byte
+  object that arrived as four bytes returned cleanly after one request, and
+  the mirror pull that asked for it then failed staged verification and threw
+  its whole staging tree away rather than asking again. The end of the read
+  now checks what is left of the server's own framing and raises
+  `IncompleteRead`, which the retry path already treats as worth another
+  attempt — so a truncated transfer costs the attempt, not the pull. It
+  covers the manifest read too, the first thing every reader fetches.
+
 - **A failed parallel download still ran the whole queue.** `download_many`
   raised on the first failure, but left its pool without `cancel_futures`, so
   every queued job executed before the caller saw the error. With the network

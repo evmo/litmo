@@ -11,6 +11,7 @@ leaves the previous local copy alone.
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import contextlib
 import dataclasses
 import datetime
@@ -745,6 +746,29 @@ class TestMirror(Base):
         got = {p.name for p in kinds._walk(self.root, self.art())}
         self.assertEqual(got, {"keep.csv", "keep2.json"})
 
+    def test_an_upload_in_flight_is_not_published_by_a_mirror_without_include(self):
+        # `include` is optional — empty means "every file" — and on such an
+        # artifact `_covers`'s own skips are the only thing standing between
+        # a half-written `.part` file and the public bucket. The filter test
+        # above cannot see that: its artifact lists `.csv` and `.json`, so
+        # the include arm refuses `partial.csv.part` whether or not the
+        # `.part` arm exists at all.
+        cfg = self.reload(SYNC_TOML.replace('include = [".csv", ".json"]\n',
+                                            ""))
+        art = {a.name: a for a in cfg.artifacts}["out"]
+        self.assertEqual(art.include, ())
+
+        self.write("out/a.csv", "finished\n")
+        self.write("out/big.csv.part", "half a row, still bei")
+        self.write("out/__pycache__/x.pyc", "junk")
+        self.write("out/notes.txt", "kept — nothing excludes it now")
+
+        remote, man = Fake(), Manifest({})
+        self.assertTrue(kinds.mirror_push(Ctx(cfg, remote, man), art))
+        self.assertEqual(sorted(remote.objects), ["out/a.csv", "out/notes.txt"])
+        self.assertEqual([e["path"] for e in man.mirror_files("out")],
+                         ["out/a.csv", "out/notes.txt"])
+
     def test_the_local_index_pairs_every_digest_with_its_own_file(self):
         # The index is built by a pool now, so the two things that can break
         # silently are the pairing — a digest attached to the wrong path
@@ -892,6 +916,49 @@ class TestMirror(Base):
         (self.root / "out/a.csv").unlink()
         with self.assertRaises(SystemExit):
             kinds.mirror_pull(ctx, self.art())
+
+    def test_a_same_length_corruption_is_caught_before_anything_is_touched(self):
+        # The corruption fixtures elsewhere change the length as well, so the
+        # size check alone satisfies them and the staged digest gate can be
+        # deleted without any of them failing. Here the bucket's bytes are
+        # exactly as long as the manifest promised and only the digest can
+        # tell them apart. `clean=True` because the gate's *position* is also
+        # under test: it runs before the install loop and before the sweep,
+        # so a refusal must leave the stale local copies and the extra where
+        # they were.
+        self.write("out/a.csv", "published-a")
+        self.write("out/b.csv", "published-b")
+        remote, man = Fake(), Manifest({})
+        ctx = self.ctx(man, remote)
+        kinds.mirror_push(ctx, self.art())
+
+        # Independently calculated: what the manifest must be promising if
+        # the gate is to have anything to compare against.
+        want = {e["path"]: e for e in man.mirror_files("out")}
+        self.assertEqual(want["out/b.csv"]["sha256"],
+                         hashlib.sha256(b"published-b").hexdigest())
+
+        rotten = b"corrupted!!"                 # same length as published-b
+        self.assertEqual(len(rotten), want["out/b.csv"]["size"])
+        self.assertNotEqual(hashlib.sha256(rotten).hexdigest(),
+                            want["out/b.csv"]["sha256"])
+        remote.objects["out/b.csv"] = rotten
+
+        self.write("out/a.csv", "local-a")      # stale: pull wants both files
+        self.write("out/b.csv", "local-b")
+        self.write("out/extra.csv", "local-extra")
+
+        with self.assertRaises(SystemExit) as e:
+            kinds.mirror_pull(ctx, self.art(), clean=True)
+        msg = str(e.exception)
+        self.assertIn("1 of 2 file(s) failed verification", msg)
+        self.assertIn("out/b.csv", msg)
+        self.assertNotIn("out/a.csv", msg)
+        self.assertIn("nothing under out was changed", msg)
+        self.assertEqual((self.root / "out/a.csv").read_text(), "local-a")
+        self.assertEqual((self.root / "out/b.csv").read_text(), "local-b")
+        self.assertEqual((self.root / "out/extra.csv").read_text(),
+                         "local-extra")
 
     def test_verification_names_every_bad_file_in_manifest_order(self):
         # The staged tree is verified by a pool now. Two things that would
@@ -1294,6 +1361,48 @@ class TestMirror(Base):
         self.assertTrue(kinds.mirror_push(ctx, self.art()))
         self.assertEqual(man.mirror_files("out")[0]["sha256"],
                          file_sha256(self.root / "out/x.csv"))
+
+    def test_a_same_size_rewrite_before_the_upload_starts_is_not_published(self):
+        # The window the digest re-read exists for, and the only one the two
+        # tests above do not cover: the file moves *after* `_local_index`
+        # hashed it and *before* `send` reads `st_mtime_ns`, so the stamp is
+        # taken from the new bytes and holds still for the whole upload, and
+        # the size does not move either. Nothing but the digest comparison in
+        # `_unchanged` can see it. No sleep and no timestamp fakery: the
+        # rewrite happens on the main thread, inside the real `_local_index`,
+        # on its way out.
+        src = self.write("out/a.csv", "AAAA")
+        remote, man = Fake(), Manifest({})
+        ctx = self.ctx(man, remote)
+
+        real_index = kinds._local_index
+
+        def racing_index(ctx_, art_, **kw):
+            idx, total = real_index(ctx_, art_, **kw)
+            src.write_bytes(b"BBBB")            # same length, new bytes
+            return idx, total
+
+        with unittest.mock.patch.object(kinds, "_local_index", racing_index):
+            with self.assertRaises(SystemExit) as e:
+                kinds.mirror_push(ctx, self.art(), workers=1)
+        self.assertIn("rewritten while they were uploading", str(e.exception))
+
+        # The stamp really was stable, so the mtime arm of `_unchanged` had
+        # nothing to say and the digest arm is what refused.
+        self.assertEqual(src.read_bytes(), b"BBBB")
+        self.assertEqual(remote.objects["out/a.csv"], b"BBBB")
+        self.assertEqual(man.mirror_files("out"), [])
+
+        # The digest of what `_local_index` measured is exactly what a
+        # manifest must not be left holding: the bucket has the other four
+        # bytes, and every reader would refuse them.
+        self.assertNotEqual(hashlib.sha256(b"AAAA").hexdigest(),
+                            hashlib.sha256(b"BBBB").hexdigest())
+
+        # …and a quiet push afterwards publishes the bytes that are there.
+        self.assertTrue(kinds.mirror_push(ctx, self.art(), workers=1))
+        self.assertEqual(man.mirror_files("out")[0]["sha256"],
+                         hashlib.sha256(b"BBBB").hexdigest())
 
     def test_an_interrupt_between_the_put_and_the_recheck_drops_the_file(self):
         # Same hole, reached by ^C in the post-upload re-hash of a large file
@@ -3358,6 +3467,27 @@ class Response:
         return self.read(n)
 
 
+def _real_response(raw: bytes) -> http.client.HTTPResponse:
+    """A genuine `http.client.HTTPResponse` over `raw`, with no socket.
+
+    The hand-written stand-ins above answer `read1` from a buffer and so
+    cannot express the one thing that matters here: a body that stops short
+    of the `Content-Length` the server declared. Only the real parser tracks
+    that.
+    """
+
+    class _Sock:
+        def __init__(self, data):
+            self._data = io.BytesIO(data)
+
+        def makefile(self, *a, **kw):
+            return self._data
+
+    r = http.client.HTTPResponse(_Sock(raw))
+    r.begin()
+    return r
+
+
 class TestRemote(Base):
     def served(self):
         """A `file://` base, so the public read path runs with no server."""
@@ -3530,21 +3660,60 @@ class TestRemote(Base):
         # The first failure decides the pull. Everything still queued behind
         # it would otherwise run anyway — at a socket timeout each, once the
         # network is what failed.
+        #
+        # Cancellation is driven by the main thread — it has to collect the
+        # failure and reach `shutdown` before anything can be dropped — so
+        # counting how many jobs a sleep let through measures how promptly
+        # that thread was scheduled, not whether the queue was cancelled.
+        # Held at collection until ten follow-ups had started, the old
+        # sleep-and-threshold form failed with "11 not less than 10" against
+        # a cancellation that had worked perfectly. So the follow-up jobs
+        # block instead: the one the worker picks up after the failure waits
+        # until the queue really has been dropped, which pins every other job
+        # behind it no matter how late the main thread arrives.
         _, remote = self.served()
-        started = []
+        started, dropped, stuck = [], threading.Event(), threading.Event()
+
+        class Splitting(cf.ThreadPoolExecutor):
+            """The real pool, with the two halves of
+            `shutdown(cancel_futures=True)` pulled apart: everything still
+            queued is cancelled first, and only then does the caller wait on
+            what is already in flight. The gap between them is the moment
+            this test needs to see."""
+
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                if cancel_futures:
+                    super().shutdown(wait=False, cancel_futures=True)
+                    dropped.set()
+                super().shutdown(wait=wait)
 
         def counting(key, dest, max_bytes=None):
             started.append(key)
             if key == "boom.csv":
                 raise urllib.error.URLError("gone")
-            time.sleep(0.02)
+            # A guard against a deadlock, not a measurement: nothing here
+            # decides how many jobs "should" have run. Once one job has
+            # waited it out the queue is plainly not being cancelled, and
+            # the rest return at once rather than each costing the same wait.
+            if not stuck.is_set() and not dropped.wait(20):
+                stuck.set()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"held")
 
         remote.download = counting
         jobs = [("boom.csv", self.root / "out/boom.csv")]
         jobs += [(f"{i}.csv", self.root / f"out/{i}.csv") for i in range(40)]
-        with self.assertRaises(urllib.error.URLError):
-            remote.download_many(jobs, workers=1)
-        self.assertLess(len(started), 10, started)
+        with unittest.mock.patch.object(cf, "ThreadPoolExecutor", Splitting):
+            with self.assertRaises(urllib.error.URLError):
+                remote.download_many(jobs, workers=1)
+
+        # One worker, so at most one follow-up can be in flight when the
+        # failure is collected, and it holds the rest behind it until they
+        # are cancelled. Anything past that ran out of a queue that was
+        # supposed to be empty.
+        self.assertFalse(stuck.is_set(), "the queue was never cancelled")
+        self.assertEqual(started[0], "boom.csv")
+        self.assertLessEqual(len(started), 2, started)
 
     def test_a_dropped_connection_is_retried(self):
         # The write path has ten botocore attempts; the read path most people
@@ -3590,6 +3759,100 @@ class TestRemote(Base):
             remote.download("a.csv", self.root / "out/a.csv")
         self.assertEqual((self.root / "out/a.csv").read_bytes(),
                          b"the whole thing")
+
+    def test_the_manifest_limit_is_enforced_while_it_streams(self):
+        # The manifest is the first thing every reader fetches and the only
+        # object read whole into memory, so its bound is the one that keeps a
+        # bucket serving an absurd document from taking the process with it.
+        # The manifest test that covers this goes through the fake bucket,
+        # which implements the limit itself — so the real read path's bound
+        # has nothing asserting it, and it can be deleted without a failure.
+        # Here the real `Remote` reads a real 3 MiB body and must stop inside
+        # it, not after it.
+        served, remote = self.served()
+        (served / "manifest.json").write_bytes(b"{" + b" " * (3 << 20))
+
+        pulled = [0]
+        real_urlopen = transport.urllib.request.urlopen
+
+        class Counting:
+            def __init__(self, r):
+                self._r = r
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._r.close()
+                return False
+
+            def __getattr__(self, name):
+                return getattr(self._r, name)
+
+            def read1(self, n=-1):
+                chunk = self._r.read1(n)
+                pulled[0] += len(chunk)
+                return chunk
+
+        with unittest.mock.patch.object(
+                transport.urllib.request, "urlopen",
+                lambda req, timeout=None: Counting(
+                    real_urlopen(req, timeout=timeout))):
+            with self.assertRaises(Oversized) as e:
+                remote.get_bytes("manifest.json", limit=1024)
+        self.assertIn("larger than 1,024 bytes", str(e.exception))
+        # One read of the stream, not the whole document: the refusal has to
+        # come from inside the loop.
+        self.assertLessEqual(pulled[0], transport.CHUNK)
+
+    def test_a_body_that_stops_short_of_content_length_is_retried(self):
+        # `read1` returns an empty chunk for a finished body and for a
+        # connection that went away mid-transfer alike, so the drain loop
+        # cannot tell them apart on its own. Before this the short read came
+        # back as a successful download: one request, four bytes of a body
+        # the server said was fifteen, and a mirror pull that then failed
+        # staged verification and discarded the whole staging tree rather
+        # than asking again. The real `HTTPResponse` is what knows, so the
+        # real one is what is used — and the real `_drain` and `_retrying`
+        # with it, since supplying the exception is the thing the existing
+        # retry test does that hides this.
+        _, remote = self.served()
+        whole = b"the whole thing"
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(whole)
+        calls = []
+
+        def flaky(req, timeout=None):
+            calls.append(req.full_url)
+            return _real_response(head + (whole[:4] if len(calls) == 1
+                                          else whole))
+
+        dest = self.root / "out/a.csv"
+        with unittest.mock.patch.object(transport.urllib.request, "urlopen",
+                                        flaky), \
+                unittest.mock.patch.object(transport, "BACKOFF", 0):
+            remote.download("a.csv", dest, len(whole))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(dest.read_bytes(), whole)
+
+    def test_a_complete_body_is_not_mistaken_for_a_truncated_one(self):
+        # The other side of the same check: a body that arrives in full must
+        # still be one request, or every download would now cost three.
+        _, remote = self.served()
+        whole = b"all of it"
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(whole)
+        calls = []
+
+        def once(req, timeout=None):
+            calls.append(req.full_url)
+            return _real_response(head + whole)
+
+        dest = self.root / "out/a.csv"
+        with unittest.mock.patch.object(transport.urllib.request, "urlopen",
+                                        once), \
+                unittest.mock.patch.object(transport, "BACKOFF", 0):
+            remote.download("a.csv", dest, len(whole))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(dest.read_bytes(), whole)
 
     def test_a_missing_object_is_not_retried(self):
         _, remote = self.served()
@@ -3924,6 +4187,75 @@ class TestRoundTripOverHttpLikeReads(Base):
             kinds.mirror_pull(ctx, {a.name: a for a in ctx.cfg.artifacts}["out"])
         self.assertEqual((self.root / "out/a.csv").read_text(), "stale but mine\n")
 
+    def test_a_pull_stops_a_body_that_outgrows_its_manifest_size(self):
+        # The size in each manifest record is what bounds the transfer, and
+        # nothing downstream can stand in for it: a mirror pull that stopped
+        # passing it would still refuse the object, but only once the whole
+        # body had been written to staging. So the assertion is on the
+        # staging writes themselves, sampled from inside the read loop, and
+        # on which of the two refusals comes back.
+        self.write("out/a.csv", "small")
+        self.publish()
+        (self.root / "out/a.csv").write_text("mine")
+        (self.bucket / "out/a.csv").write_bytes(b"x" * (3 << 20))
+
+        ctx = self.reader()
+        art = {a.name: a for a in ctx.cfg.artifacts}["out"]
+        promised = next(e["size"] for e in ctx.manifest.mirror_files("out")
+                        if e["path"] == "out/a.csv")
+        self.assertEqual(promised, len("small"))
+
+        staging, staged = [], []
+        real_staging = kinds._staging
+
+        def recording_staging(cfg):
+            td = real_staging(cfg)
+            staging.append(Path(td.name))
+            return td
+
+        class Watching:
+            """The real response, with the staging tree measured on disk
+            before each read of it."""
+
+            def __init__(self, r):
+                self._r = r
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._r.close()
+                return False
+
+            def __getattr__(self, name):
+                return getattr(self._r, name)
+
+            def read1(self, n=-1):
+                staged.append(sum(p.stat().st_size for d in staging
+                                  for p in d.rglob("*.part")))
+                return self._r.read1(n)
+
+        real_urlopen = transport.urllib.request.urlopen
+        with unittest.mock.patch.object(kinds, "_staging", recording_staging), \
+                unittest.mock.patch.object(
+                    transport.urllib.request, "urlopen",
+                    lambda req, timeout=None: Watching(
+                        real_urlopen(req, timeout=timeout))):
+            with self.assertRaises(SystemExit) as e:
+                kinds.mirror_pull(ctx, art, workers=1)
+
+        # The transport refused it, not the staged verification pass that
+        # runs after a completed download.
+        msg = str(e.exception)
+        self.assertIn(f"longer than the {promised:,} bytes promised", msg)
+        self.assertIn("nothing under out was changed", msg)
+        self.assertNotIn("failed verification", msg)
+        # Sampled at least once, and never past what the manifest promised.
+        self.assertTrue(staged)
+        self.assertLessEqual(max(staged), promised)
+        self.assertEqual((self.root / "out/a.csv").read_text(), "mine")
+
+
 
 # --- the command line -------------------------------------------------------
 
@@ -4008,11 +4340,63 @@ class TestCli(Base):
         self.assertIn(b"out/a.csv", remote.objects["manifest.json"])
 
     def test_push_with_nothing_to_say_writes_no_manifest(self):
+        # Identical bytes are not the same thing as no write. A redundant
+        # conditional PUT moves the manifest's version, and the next
+        # publisher's If-Match is then against an ETag the bucket no longer
+        # has — so the bucket's own write record is what is asserted here,
+        # not just what it ended up holding.
         self.write("out/a.csv", "hello")
         _, remote = self.run_cli(["push", "out"])
         before = remote.objects["manifest.json"]
+        etag = remote.etags["manifest.json"]
+        writes = []
+        real_put = remote.put_bytes
+        remote.put_bytes = lambda key, body, ctype, **kw: (
+            writes.append(key), real_put(key, body, ctype, **kw))[1]
+
         self.run_cli(["push", "out"], remote=remote)
+        self.assertEqual(writes, [])
         self.assertEqual(remote.objects["manifest.json"], before)
+        self.assertEqual(remote.etags["manifest.json"], etag)
+
+    def test_a_dry_run_push_changes_nothing_in_the_bucket(self):
+        # `--dry-run` promises to "upload nothing", and two separate guards
+        # keep that promise: the mirror kind's own early return and the
+        # manifest commit in `cmd_push`. Asserting only on the manifest would
+        # pass while the objects themselves were overwritten — and a
+        # published object whose manifest digest is now stale fails every
+        # reader's pull.
+        self.write("out/keep.csv", "keep")
+        self.write("out/edit.csv", "old")
+        self.write("out/drop.csv", "drop")
+        _, remote = self.run_cli(["push", "out"])
+        objects = dict(remote.objects)
+        etags = dict(remote.etags)
+        uploads = remote.uploads
+
+        self.write("out/edit.csv", "NEW")            # changed
+        self.write("out/added.csv", "added")         # added
+        (self.root / "out/drop.csv").unlink()        # removed
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc, _ = self.run_cli(["push", "out", "--dry-run"], remote=remote)
+        self.assertEqual(rc, 0)
+
+        self.assertEqual(remote.uploads, uploads)
+        self.assertEqual(set(remote.objects), set(objects))
+        self.assertEqual(remote.objects, objects)
+        self.assertEqual(remote.etags, etags)
+        # And in particular the object whose local file moved still holds the
+        # bytes its published digest describes.
+        self.assertEqual(remote.objects["out/edit.csv"], b"old")
+
+        # A preview that changes nothing has to still say what it would do.
+        said = out.getvalue()
+        self.assertIn("out/edit.csv", said)
+        self.assertIn("out/added.csv", said)
+        self.assertIn("out/drop.csv", said)
+        self.assertNotIn("wrote manifest.json", said)
 
     def test_a_concurrent_publisher_is_refused_not_overwritten(self):
         class Racing(Fake):

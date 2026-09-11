@@ -105,6 +105,9 @@ def _chunks(reader):
     `read1` rather than `read`: `read` does not come back until it has the
     whole chunk it was asked for, so a body arriving a byte at a time spends
     hours inside one call and no check placed around that call ever runs.
+    The cost of that choice is that `read1` answers a finished body and a
+    connection that went away mid-transfer identically, with an empty chunk —
+    so the end of the loop asks the response itself, below.
 
     The floor is `MIN_RATE` measured over the whole transfer, and it applies
     only after `TIMEOUT` has passed. `TimeoutError` is what `_transient`
@@ -121,6 +124,18 @@ def _chunks(reader):
                 f"stalled — {total:,} bytes in {elapsed:.0f}s, under the "
                 f"{MIN_RATE:,} bytes/s this holds a transfer to")
         yield chunk
+    # What is left of the framing the server declared: `HTTPResponse.length`
+    # counts down as the body arrives and sits above zero when the socket
+    # closed early. Without this the caller was handed a short body as a
+    # successful read — a 15-byte object that stopped at 4 returned cleanly
+    # after one request, and the mirror pull that asked for it failed staged
+    # verification and threw its whole staging tree away rather than asking
+    # again. `IncompleteRead` is what `_transient` already reads as worth
+    # another attempt, so a truncated transfer now costs the attempt.
+    # A reader with no framing to check — a `file://` response, or a body
+    # delimited only by the close — has no `length`, and is left alone.
+    if left := getattr(reader, "length", None):
+        raise http.client.IncompleteRead(b"", left)
 
 
 def _drain(reader, fh, max_bytes: int | None) -> int:
