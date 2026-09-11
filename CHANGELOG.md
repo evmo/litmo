@@ -170,6 +170,30 @@ tolerated are now refused, and two commands exit differently.
   `--version` exits non-zero — a missing shared library, a half-finished
   install — printed an empty version and exited 0. It now fails, with the
   first lines of what quarto said.
+- **Retrying an archive pull after a killed one could delete the only local
+  copy.** An install parks the outgoing tree beside itself before moving the
+  new one into place, and a later run reads a leftover park as a dead run's
+  rubbish and sweeps it. That is only true while the artifact directory is
+  still there: a run killed between the park and the move leaves the park
+  holding the *only* copy, and the retry deleted it before finding that out —
+  so a retry that then failed for any reason left neither. With the
+  destination absent, an existing park is now adopted as the outgoing copy
+  and put back if the install fails.
+- **A merge pull silently dropped published symlinks.** `pull` without
+  `--clean` installed a link naming a regular file but not one naming a
+  directory, and not a dangling one — and because the tree hash does not
+  count links either, the pull reported the tree was a superset of the
+  bucket's while two of its entries were missing. `pull --clean` was never
+  affected. All three arrive now, with their targets intact.
+- **Renaming an archive left the bucket describing the old layout.** An
+  artifact's `tree_hash` is built from paths relative to its own directory,
+  so changing its `path` or its `key` in `sync.toml` does not move the
+  digest: `push` said "up to date" and never rewrote the manifest, `status`
+  said "in sync" and exited 0, and every reader's pull under the new
+  configuration failed with "the bundle is not the tree the manifest
+  describes" — with no ordinary push able to mend it. Both verbs now compare
+  where the entry says the artifact is as well as what it holds; `status`
+  reads `... elsewhere` until it has been pushed.
 
 ### Added
 

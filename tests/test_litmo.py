@@ -490,6 +490,39 @@ class TestCreds(Base):
 
 # --- identity ---------------------------------------------------------------
 
+# A fixed tree and the digest it must always have. Every other hash test
+# below establishes a *relative* property — same bytes agree, changed bytes
+# differ — which a changed serialisation satisfies just as well: both sides
+# of a freshly generated round trip agree on the new format while every hash
+# already committed to a bucket stops matching. Replacing the NUL separator
+# in `hashing.tree_hash` with `|` left the whole suite green, and would have
+# made every published archive unpullable.
+#
+# So this one value is not computed by litmo. It was derived from the
+# format `hashing.tree_hash` documents — for each file, sorted by its
+# path relative to the directory: the path, a NUL, the lowercase hex
+# sha-256 of its bytes, a newline — using coreutils alone:
+#
+#   $ printf 'alpha\n' > a.txt; mkdir sub; printf 'beta\n' > sub/b.txt
+#   $ ha=$(sha256sum a.txt | cut -d' ' -f1)
+#   $ hb=$(sha256sum sub/b.txt | cut -d' ' -f1)
+#   $ { printf 'a.txt'; printf '\0'; printf %s "$ha"; printf '\n'
+#       printf 'sub/b.txt'; printf '\0'; printf %s "$hb"
+#       printf '\n'; } | sha256sum
+#   a3338c328701eec0ab2aadb60025f8bc97d9a3009b823432554cc1f2aebb5435
+#
+# Do not regenerate these when the implementation changes. A change that
+# moves them is a change that orphans every manifest already in a bucket,
+# and the only safe way to make one is to bump a format marker and teach
+# the reader both.
+TREE_FIXTURE = {"a.txt": "alpha\n", "sub/b.txt": "beta\n"}
+FIXTURE_HASH = "a3338c328701eec0ab2aadb60025f8bc97d9a3009b823432554cc1f2aebb5435"
+FIXTURE_FILES, FIXTURE_BYTES = 2, 11
+# The same file hashed as a whole artifact of its own: `_files` takes the
+# parent as the base, so the name is still part of the digest.
+LONE_FILE_HASH = "e194db447df1acfc07e94a18c65cb878450f324b326b86cb012eb418f5a0b0a8"
+
+
 class TestTreeHash(Base):
     def test_same_bytes_same_hash_regardless_of_creation_order(self):
         self.write("a/one.txt", "1")
@@ -515,6 +548,15 @@ class TestTreeHash(Base):
 
     def test_absent_tree(self):
         self.assertEqual(tree_hash(self.root / "nothing"), ("", 0, 0))
+
+    def test_a_fixed_tree_keeps_the_digest_already_in_the_buckets(self):
+        for rel, text in TREE_FIXTURE.items():
+            self.write(f"fixture/{rel}", text)
+        self.assertEqual(
+            tree_hash(self.root / "fixture"),
+            (FIXTURE_HASH, FIXTURE_FILES, FIXTURE_BYTES))
+        self.assertEqual(tree_hash(self.root / "fixture/a.txt"),
+                         (LONE_FILE_HASH, 1, 6))
 
 
 # --- manifest migration -----------------------------------------------------
@@ -1565,6 +1607,12 @@ class TestMirror(Base):
 
 # --- the archive kind -------------------------------------------------------
 
+# The three link shapes a bundle can carry, and where each points: one
+# naming a regular file, one naming a directory, one naming nothing.
+PUBLISHED_LINKS = {"tofile": "sub/x.json", "alias": "sub",
+                   "dangling": "future.json"}
+
+
 class TestArchive(Base):
     def art(self):
         return {a.name: a for a in self.cfg.artifacts}["cache"]
@@ -1749,6 +1797,88 @@ class TestArchive(Base):
         self.assertEqual(os.readlink(link), "1.json")
         self.assertEqual(tree_hash(self.root / "data/cache"), before)
 
+    def _mixed_link_tree(self):
+        """A published tree holding all three link shapes a bundle can carry:
+        one naming a regular file, one naming a directory, one naming
+        nothing. Returns the ctx it was published through."""
+        self.write("data/cache/sub/x.json", '{"n": 1}')
+        os.symlink("sub/x.json", self.root / "data/cache/tofile")
+        os.symlink("sub", self.root / "data/cache/alias")
+        os.symlink("future.json", self.root / "data/cache/dangling")
+        ctx = Ctx(self.cfg, Fake(), Manifest({}))
+        kinds.archive_push(ctx, self.art())
+        return ctx
+
+    def _links(self):
+        d = self.root / "data/cache"
+        return {p.relative_to(d).as_posix(): os.readlink(p)
+                for p in sorted(d.rglob("*")) if p.is_symlink()}
+
+    def test_a_merge_installs_every_published_link(self):
+        # The merge installer selected with `is_file()`, which *follows* the
+        # link: a symlink to a directory and a dangling symlink both answered
+        # False and were dropped, while one naming a regular file came
+        # through. `tree_hash` selects the same way, so the digest agreed
+        # afterwards and the pull reported a superset it had not installed.
+        ctx = self._mixed_link_tree()
+        shutil.rmtree(self.root / "data/cache")
+        self.write("data/cache/mine.json", "MINE")
+
+        kinds.archive_pull(ctx, self.art())          # an ordinary merge
+
+        d = self.root / "data/cache"
+        self.assertEqual((d / "mine.json").read_text(), "MINE")
+        self.assertEqual((d / "sub/x.json").read_text(), '{"n": 1}')
+        self.assertEqual(self._links(), PUBLISHED_LINKS)
+
+    def test_a_clean_pull_installs_every_published_link_too(self):
+        # The parity the merge was missing: `--clean` renames the whole
+        # verified tree into place, so it has always carried all three.
+        ctx = self._mixed_link_tree()
+        shutil.rmtree(self.root / "data/cache")
+        self.write("data/cache/mine.json", "MINE")
+
+        kinds.archive_pull(ctx, self.art(), clean=True)
+
+        self.assertFalse((self.root / "data/cache/mine.json").exists())
+        self.assertEqual(self._links(), PUBLISHED_LINKS)
+
+    def test_a_merge_refuses_a_published_link_a_local_directory_blocks(self):
+        # A link now being installed is a path that can be in the way, and it
+        # is the same conflict a published file meets: refuse before the move
+        # loop starts rather than fail ENOTEMPTY halfway through it.
+        ctx = self._mixed_link_tree()
+        shutil.rmtree(self.root / "data/cache")
+        self.write("data/cache/alias/local.json", "MINE")
+
+        with self.assertRaises(SystemExit) as e:
+            kinds.archive_pull(ctx, self.art())
+        self.assertIn("data/cache/alias is a directory here", str(e.exception))
+        self.assertEqual((self.root / "data/cache/alias/local.json"
+                          ).read_text(), "MINE")
+
+    def test_publication_records_the_frozen_tree_digest_and_pulls_it_back(self):
+        # The other two places the serialisation is load-bearing: the value
+        # `archive_push` writes into the manifest (litmo/kinds.py) and the
+        # value `archive_pull` re-checks the staged tree against. Both are
+        # held to the constant in TestTreeHash rather than to whatever the
+        # implementation computes today, so a changed format is a failure
+        # here and not a bucket full of archives no reader can pull.
+        for rel, text in TREE_FIXTURE.items():
+            self.write(f"data/cache/{rel}", text)
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+
+        entry = man.get("cache")
+        self.assertEqual(entry["tree_hash"], FIXTURE_HASH)
+        self.assertEqual(entry["files"], FIXTURE_FILES)
+        self.assertEqual(entry["raw_bytes"], FIXTURE_BYTES)
+
+        shutil.rmtree(self.root / "data/cache")
+        kinds.archive_pull(ctx, self.art())
+        self.assertEqual(self._tree(), TREE_FIXTURE)
+
     def test_a_hardlink_is_still_packed_as_a_link(self):
         # The fast header path skips anything with st_nlink > 1, so the
         # stdlib's inode bookkeeping still turns the second name into a
@@ -1778,14 +1908,28 @@ class TestArchive(Base):
         self.assertTrue((self.root / "data/cache/1.json").exists())
 
     def test_pull_without_clean_merges_and_keeps_extras(self):
-        self.write("data/cache/1.json", "{}")
+        # Both halves have to be *done*, not merely survive: the published
+        # file has drifted locally and must be put back, another published
+        # file is gone and must be installed, and the local-only file must
+        # come through untouched. The earlier version of this test published
+        # one file, created one extra and asserted both existed — which they
+        # already did before the pull, so gutting `archive_pull` to `return
+        # None` passed it.
+        self.write("data/cache/1.json", '{"n": 1}')
+        self.write("data/cache/2.json", '{"n": 2}')
         remote, man = Fake(), Manifest({})
         ctx = Ctx(self.cfg, remote, man)
         kinds.archive_push(ctx, self.art())
-        self.write("data/cache/mine.json", "{}")
+
+        self.write("data/cache/1.json", "local drift")   # to be replaced
+        (self.root / "data/cache/2.json").unlink()       # to be restored
+        self.write("data/cache/mine.json", "MINE")       # to be kept
+
         kinds.archive_pull(ctx, self.art())
-        self.assertTrue((self.root / "data/cache/mine.json").exists())
-        self.assertTrue((self.root / "data/cache/1.json").exists())
+
+        self.assertEqual(self._tree(), {"1.json": '{"n": 1}',
+                                        "2.json": '{"n": 2}',
+                                        "mine.json": "MINE"})
 
     def test_packing_leans_on_nothing_deprecated(self):
         # `_Tar.gettarinfo` deliberately drops the back-reference the stdlib
@@ -1817,6 +1961,95 @@ class TestArchive(Base):
         self.assertFalse(man.dirty)
         self.assertEqual(remote.uploads, uploads)
         self.assertEqual(man.get("cache"), entry)
+
+    RENAMED_TOML = SYNC_TOML.replace(
+        'path = "data/cache"', 'path = "data/renamed"').replace(
+        'key  = "v1/data-cache.tar.zst"', 'key  = "v2/data-renamed.tar.zst"')
+
+    def test_a_renamed_archive_is_republished_without_force(self):
+        # A tree hash is built from paths relative to the artifact directory,
+        # so a rename does not move it — and a no-op decision that reads only
+        # the digest leaves the manifest describing `data/cache` while
+        # sync.toml says `data/renamed`. The bundle in the bucket still holds
+        # `data/cache/...`, so every reader's pull refuses it, and no
+        # ordinary push ever mends it.
+        self.write("data/cache/x.json", '{"n": 1}')
+        remote, man = Fake(), Manifest({})
+        self.assertTrue(kinds.archive_push(Ctx(self.cfg, remote, man),
+                                           self.art()))
+
+        (self.root / "data/cache").rename(self.root / "data/renamed")
+        cfg = self.reload(self.RENAMED_TOML)
+        art = {a.name: a for a in cfg.artifacts}["cache"]
+        ctx = Ctx(cfg, remote, man)
+
+        self.assertTrue(kinds.archive_push(ctx, art))   # not "up to date"
+        self.assertIn("v2/data-renamed.tar.zst", remote.objects)
+
+        # What a reader actually gets: the committed document, re-read.
+        fresh = Manifest._migrate(json.loads(man.dump()), cfg)
+        entry = fresh.get("cache")
+        self.assertEqual(entry["path"], "data/renamed")
+        self.assertEqual(entry["key"], "v2/data-renamed.tar.zst")
+
+        shutil.rmtree(self.root / "data/renamed")
+        kinds.archive_pull(Ctx(cfg, remote, fresh), art)
+        self.assertEqual((self.root / "data/renamed/x.json").read_text(),
+                         '{"n": 1}')
+
+    def test_status_says_differs_while_the_bucket_holds_the_old_layout(self):
+        # The same blind spot one verb over: `archive_status` compared only
+        # the tree hash, so after a rename it said "in sync" and exited zero
+        # — sending a maintainer away without the push that mends the bucket,
+        # while a fresh reader's pull under the same config cannot work.
+        self.write("data/cache/x.json", '{"n": 1}')
+        remote, man = Fake(), Manifest({})
+        kinds.archive_push(Ctx(self.cfg, remote, man), self.art())
+
+        (self.root / "data/cache").rename(self.root / "data/renamed")
+        cfg = self.reload(self.RENAMED_TOML)
+        art = {a.name: a for a in cfg.artifacts}["cache"]
+        ctx = Ctx(cfg, remote, man)
+
+        report = kinds.archive_status(ctx, art)
+        self.assertEqual(report.verdict, kinds.DIFFERS)
+        self.assertFalse(report.ok)
+        self.assertIn("elsewhere", report.remote)
+
+        kinds.archive_push(ctx, art)
+        self.assertEqual(kinds.archive_status(ctx, art).verdict, kinds.IN_SYNC)
+
+    def test_a_rekeyed_archive_is_republished_without_force(self):
+        # The key moves on its own too — a `v1/` to `v2/` bump with the tree
+        # untouched. The manifest kept pointing at the old object.
+        self.write("data/cache/x.json", '{"n": 1}')
+        remote, man = Fake(), Manifest({})
+        kinds.archive_push(Ctx(self.cfg, remote, man), self.art())
+
+        cfg = self.reload(SYNC_TOML.replace('key  = "v1/data-cache.tar.zst"',
+                                            'key  = "v2/data-cache.tar.zst"'))
+        art = {a.name: a for a in cfg.artifacts}["cache"]
+        self.assertTrue(kinds.archive_push(Ctx(cfg, remote, man), art))
+        self.assertEqual(man.get("cache")["key"], "v2/data-cache.tar.zst")
+        self.assertIn("v2/data-cache.tar.zst", remote.objects)
+
+    def test_an_entry_that_never_recorded_a_path_is_not_re_uploaded(self):
+        # A manifest written before entries carried `path` does not say where
+        # it put itself, and a push must not read that silence as a move:
+        # re-uploading every legacy archive to record something already true
+        # is not what this decision is for.
+        self.write("data/cache/x.json", '{"n": 1}')
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+        legacy = {k: v for k, v in man.get("cache").items() if k != "path"}
+        man.artifacts["cache"] = legacy
+        man.dirty = False
+        uploads = remote.uploads
+
+        self.assertFalse(kinds.archive_push(ctx, self.art()))
+        self.assertEqual(remote.uploads, uploads)
+        self.assertFalse(man.dirty)
 
     def test_pull_rejects_a_corrupt_bundle(self):
         self.write("data/cache/1.json", "{}")
@@ -1884,6 +2117,160 @@ class TestArchive(Base):
             kinds.archive_pull(ctx, self.art(), force=True)
         self.assertIn("was not touched", str(e.exception))
         self.assertEqual(tree_hash(self.root / "data/cache"), before)
+
+    def _crafted_bundle(self, dest: Path, members) -> Path:
+        """A real tar.zst holding exactly `members` — (TarInfo, bytes|None).
+
+        Written member by member rather than by packing a directory, because
+        the shapes it exists to carry are ones `_pack` refuses to create:
+        nothing on the publishing side can produce a name with `..` in it.
+        A hostile or corrupt bucket can serve one, and `_unpack` is the only
+        thing between that bundle and the filesystem.
+        """
+        cctx = kinds._zstd().ZstdCompressor(level=1)
+        with dest.open("wb") as raw, cctx.stream_writer(raw) as z:
+            with tarfile.open(fileobj=z, mode="w|") as tar:
+                for info, body in members:
+                    tar.addfile(info, io.BytesIO(body) if body else None)
+        return dest
+
+    def test_unpack_refuses_members_that_write_outside_the_staging_tree(self):
+        # The security boundary is `filter="data"` at the single `tar.extract`
+        # in `_unpack`. Everything else on the pull path looks at the bundle
+        # *after* extraction — the stray walk, the tree hash — and none of it
+        # can undo a write that has already landed somewhere else. So this
+        # holds the extraction itself: each member is refused, and the file it
+        # aimed at still has its own bytes afterwards.
+        stage = self.root / "stage"
+        stage.mkdir()
+        beside = stage / "sentinel"
+        elsewhere = self.root / "elsewhere.txt"
+
+        climbing = tarfile.TarInfo("../sentinel")
+        climbing.size = 7
+        leaving = tarfile.TarInfo("escape")
+        leaving.type, leaving.linkname = tarfile.SYMTYPE, "../sentinel"
+        device = tarfile.TarInfo("dev")
+        device.type, device.devmajor, device.devminor = tarfile.CHRTYPE, 1, 3
+        absolute = tarfile.TarInfo("absolute")
+        absolute.name, absolute.size = str(elsewhere), 7
+
+        for name, member, refused in (
+                ("a member climbing out with ..", climbing, True),
+                ("a symlink out of the tree", leaving, True),
+                ("a device node", device, True),
+                # Not refused — the `data` filter makes an absolute name
+                # relative and extracts it *inside* the destination, which
+                # is the same guarantee by another route. `fully_trusted`
+                # joins it and writes straight to the path it names.
+                ("an absolute member name", absolute, False)):
+            with self.subTest(name):
+                tree = stage / "tree"
+                shutil.rmtree(tree, ignore_errors=True)
+                tree.mkdir()
+                beside.write_text("KEEP")
+                elsewhere.write_text("KEEP")
+                bundle = self._crafted_bundle(
+                    stage / "hostile.tar.zst",
+                    [(member, b"CHANGED" if member.isreg() else None)])
+                if refused:
+                    with self.assertRaises(tarfile.FilterError):
+                        kinds._unpack(bundle, tree)
+                    self.assertEqual(list(tree.iterdir()), [])
+                else:
+                    kinds._unpack(bundle, tree)
+                    landed = [p for p in tree.rglob("*") if p.is_file()]
+                    self.assertEqual([p.read_text() for p in landed],
+                                     ["CHANGED"])
+                self.assertEqual(beside.read_text(), "KEEP")
+                self.assertEqual(elsewhere.read_text(), "KEEP")
+
+    def test_the_expansion_limits_bite_before_the_member_that_crosses_them(self):
+        # `MAX_MEMBERS` and `MAX_UNPACKED` are the only bound on what a
+        # bundle expands to — the download is held to its *compressed* size,
+        # and the digest that proves the bundle genuine has already matched
+        # by the time `_unpack` runs. Disabling either branch left the whole
+        # suite green, so both are pinned here at the boundary: two members
+        # of four bytes each, with the limits moved down around them.
+        stage = self.root / "stage"
+        stage.mkdir()
+        members = []
+        for name in ("a.json", "b.json"):
+            info = tarfile.TarInfo(f"data/cache/{name}")
+            info.size = 4
+            members.append((info, b"{ }\n"))
+        bundle = self._crafted_bundle(stage / "two.tar.zst", members)
+
+        for limits, refusal in (
+                ({"MAX_MEMBERS": 2, "MAX_UNPACKED": 8}, None),
+                ({"MAX_MEMBERS": 1, "MAX_UNPACKED": 8},
+                 "holds more than 1 members"),
+                ({"MAX_MEMBERS": 2, "MAX_UNPACKED": 7},
+                 "unpacks to more than 7 B")):
+            with self.subTest(**limits):
+                tree = stage / "tree"
+                shutil.rmtree(tree, ignore_errors=True)
+                tree.mkdir()
+                with unittest.mock.patch.multiple(kinds, **limits):
+                    if refusal is None:
+                        kinds._unpack(bundle, tree)
+                    else:
+                        with self.assertRaises(SystemExit) as e:
+                            kinds._unpack(bundle, tree)
+                        self.assertIn(refusal, str(e.exception))
+                landed = sorted(p.name for p in (tree / "data/cache").iterdir()
+                                ) if (tree / "data/cache").exists() else []
+                # The offending member is refused *before* it is written, so
+                # the second file never reaches the disk.
+                self.assertEqual(
+                    landed, ["a.json", "b.json"] if refusal is None
+                    else ["a.json"])
+
+    def test_a_pull_past_an_expansion_limit_keeps_the_local_tree(self):
+        # Through the real pull: the refusal has to leave the existing
+        # artifact alone and take its staging directory with it.
+        for name in ("1.json", "2.json"):
+            self.write(f"data/cache/{name}", "{}")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+        self.write("data/cache/1.json", "irreplaceable local edit")
+        before = self._tree()
+
+        with unittest.mock.patch.object(kinds, "MAX_MEMBERS", 1):
+            with self.assertRaises(SystemExit) as e:
+                kinds.archive_pull(ctx, self.art(), clean=True)
+        self.assertIn("holds more than 1 members", str(e.exception))
+        self.assertEqual(self._tree(), before)
+        self.assertEqual(
+            list((config.state_dir(self.root) / "tmp").glob("stage-*")), [])
+
+    def test_a_pull_of_a_bundle_that_climbs_out_is_refused_intact(self):
+        # The same hostile bundle through the real pull: a reader is told the
+        # bundle would not unpack and the local tree is exactly as it was.
+        self.write("data/cache/1.json", "{}")
+        remote, man = Fake(), Manifest({})
+        ctx = Ctx(self.cfg, remote, man)
+        kinds.archive_push(ctx, self.art())
+        before = tree_hash(self.root / "data/cache")
+
+        climbing = tarfile.TarInfo("../../../../escaped.txt")
+        climbing.size = 7
+        body = self._crafted_bundle(
+            self.root / "hostile.tar.zst", [(climbing, b"CHANGED")]
+        ).read_bytes()
+        (self.root / "hostile.tar.zst").unlink()
+        remote.objects["v1/data-cache.tar.zst"] = body
+        man.artifacts["cache"]["archive_sha256"] = hashlib.sha256(
+            body).hexdigest()
+        man.artifacts["cache"]["archive_bytes"] = len(body)
+
+        with self.assertRaises(SystemExit) as e:
+            kinds.archive_pull(ctx, self.art(), force=True)
+        self.assertIn("would not unpack", str(e.exception))
+        self.assertIn("was not touched", str(e.exception))
+        self.assertEqual(tree_hash(self.root / "data/cache"), before)
+        self.assertFalse((self.root / "escaped.txt").exists())
 
     def test_clean_pull_keeps_a_symlinked_artifact_directory(self):
         outside = Path(tempfile.mkdtemp(prefix="litmo-outside-")).resolve()
@@ -2269,6 +2656,48 @@ class TestArchive(Base):
         self.assertEqual([p.name for p in (self.root / "data").iterdir()],
                          ["cache"])
 
+    def test_a_failed_retry_after_a_killed_install_keeps_the_only_copy(self):
+        # The park sweep above is only correct while a live destination
+        # exists: that park is then a superseded generation. A run killed
+        # between `os.replace(dest, parked)` and the move leaves the park
+        # holding the *only* local copy, with nothing at the destination —
+        # and sweeping it before finding that out, then failing the move,
+        # left neither. Both irreplaceable files, gone, on a retry.
+        ctx = self._diverged_clean_pull()
+        before = self._tree()
+        dest, park = self.root / "data/cache", self.root / "data/.cache.litmo-old"
+        os.replace(dest, park)                 # the killed run's leftovers
+        self.assertFalse(dest.exists())
+
+        real_move = kinds._move
+
+        def failing_move(src, d):
+            if src.name == "cache":            # the staged tree -> destination
+                raise OSError(errno.EIO, "I/O error")
+            return real_move(src, d)
+
+        with unittest.mock.patch.object(kinds, "_move", failing_move):
+            with self.assertRaises(OSError):
+                kinds.archive_pull(ctx, self.art(), clean=True)
+
+        self.assertTrue(dest.is_dir(), "the only local copy was deleted")
+        self.assertEqual(self._tree(), before)
+        self.assertEqual([p.name for p in (self.root / "data").iterdir()],
+                         ["cache"])           # nothing parked left behind
+
+    def test_a_retry_after_a_killed_install_still_installs_and_sweeps(self):
+        # The other half: adopting the park must not stop the retry from
+        # succeeding, nor leave the park behind once it has.
+        ctx = self._diverged_clean_pull()
+        dest, park = self.root / "data/cache", self.root / "data/.cache.litmo-old"
+        os.replace(dest, park)
+
+        kinds.archive_pull(ctx, self.art(), clean=True)
+
+        self.assertEqual(self._tree(), {"published.json": "published"})
+        self.assertEqual([p.name for p in (self.root / "data").iterdir()],
+                         ["cache"])
+
     @unittest.skipIf(kinds.fcntl is None, "no POSIX file locks here")
     def test_two_concurrent_installs_cannot_destroy_the_artifact(self):
         # Two pulls of one artifact shared `.cache.litmo-old`: the second read
@@ -2339,6 +2768,29 @@ class TestArchive(Base):
             self.assertLess(time.monotonic() - start, 10)
         self.assertIn("another litmo has been installing", str(e.exception))
         self.assertIn("was not touched", str(e.exception))
+
+    @unittest.skipIf(kinds.fcntl is None, "no POSIX file locks here")
+    def test_a_pull_installs_under_the_lock_and_not_beside_it(self):
+        # The two tests above prove `_installing` works; neither proves that
+        # the thing which actually calls `_swap` ever asks for it. Replacing
+        # `archive_pull`'s `_installing` with `contextlib.nullcontext()` left
+        # the whole suite green, which is exactly the regression that matters:
+        # `_swap`'s park has a fixed name, so an unserialised pull is the
+        # concurrency bug `_installing` exists to close.
+        ctx = self._diverged_clean_pull()
+        before = self._tree()
+
+        with kinds._installing(self.cfg, self.art()), \
+                unittest.mock.patch.object(kinds, "INSTALL_WAIT", 0):
+            with self.assertRaises(SystemExit) as e:
+                kinds.archive_pull(ctx, self.art(), clean=True)
+        self.assertIn("another litmo has been installing", str(e.exception))
+        self.assertEqual(self._tree(), before)      # nothing was installed
+        self.assertFalse((self.root / "data/.cache.litmo-old").exists())
+
+        # Released: the same pull, unchanged, goes through.
+        kinds.archive_pull(ctx, self.art(), clean=True)
+        self.assertEqual(self._tree(), {"published.json": "published"})
 
     @unittest.skipUnless(OTHER_FS, "no second writable filesystem here")
     def test_a_clean_pull_onto_another_filesystem_swaps_and_rolls_back(self):
@@ -2449,6 +2901,33 @@ class TestArchive(Base):
         for name in ("onto-a-file", "onto-a-dir"):
             self.assertFalse((elsewhere / name).is_symlink())
             self.assertEqual((elsewhere / name).read_text(), "FROM THE BUCKET")
+        self.assertEqual([p.name for p in elsewhere.iterdir()
+                          if p.name.endswith(".litmo-part")], [])
+
+    @unittest.skipUnless(OTHER_FS, "no second writable filesystem here")
+    def test_a_cross_filesystem_merge_installs_every_published_link(self):
+        # A merge now moves links as well as files, so the EXDEV fallback in
+        # `_move` carries them too — and it has to arrive as a link with the
+        # same target, not as a copy of whatever it names, and not fail
+        # outright on one that names nothing.
+        elsewhere = Path(tempfile.mkdtemp(prefix="litmo-fs-", dir=OTHER_FS))
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        (self.root / "data").mkdir()
+        (self.root / "data/cache").symlink_to(elsewhere)
+        self.assertNotEqual(os.stat(self.root).st_dev, os.stat(elsewhere).st_dev)
+
+        ctx = self._mixed_link_tree()
+        for p in elsewhere.iterdir():                # a reader's fresh copy
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+        (elsewhere / "mine.json").write_text("MINE")
+
+        kinds.archive_pull(ctx, self.art())
+
+        self.assertEqual((elsewhere / "mine.json").read_text(), "MINE")
+        self.assertEqual(self._links(), PUBLISHED_LINKS)
         self.assertEqual([p.name for p in elsewhere.iterdir()
                           if p.name.endswith(".litmo-part")], [])
 
@@ -2972,13 +3451,42 @@ class TestRemote(Base):
         self.assertEqual(self._sleeps_for(self._rate_limited("30", code=503)),
                          [30, 30])
 
+    # A fixed instant to read the clock at, and the HTTP-date exactly 45
+    # seconds after it, written out rather than computed.
+    FROZEN_NOW = datetime.datetime(2026, 3, 1, 12, 0, 0, tzinfo=datetime.UTC)
+    FROZEN_PLUS_45 = "Sun, 01 Mar 2026 12:00:45 GMT"
+
+    def _clock_at(self, now):
+        """Freeze the clock `remote._retry_after` reads.
+
+        It answers with the server's date minus its own `now`, so a test that
+        builds that date from the real clock is quietly asserting that
+        nothing happens between the two reads — a scheduling pause, an ntp
+        step, a loaded machine. Reproduced by advancing only the production
+        side by three seconds: the answer came back 41.149121 against a
+        two-second tolerance on 45, and the tolerance was there in the first
+        place because formatting an HTTP-date drops the sub-second part.
+        Frozen, the assertion is exact and the test cannot be made to fail by
+        the machine it runs on.
+        """
+        shim = unittest.mock.Mock(UTC=datetime.UTC)
+        shim.datetime.now.return_value = now
+        return unittest.mock.patch.object(transport, "datetime", shim)
+
     def test_an_http_date_retry_after_is_read_as_well_as_delta_seconds(self):
         # RFC 9110 allows both forms and servers send both.
-        when = (datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(seconds=45))
-        asked = transport._retry_after(
-            self._rate_limited(email.utils.format_datetime(when)))
-        self.assertAlmostEqual(asked, 45, delta=2)
+        with self._clock_at(self.FROZEN_NOW):
+            asked = transport._retry_after(
+                self._rate_limited(self.FROZEN_PLUS_45))
+        self.assertEqual(asked, 45)
+
+    def test_an_http_date_is_obeyed_by_the_retry_loop_as_well_as_parsed(self):
+        # And it reaches the sleeps: `_retry_after` is only useful because
+        # `_retrying` prefers it to its own backoff.
+        with self._clock_at(self.FROZEN_NOW):
+            self.assertEqual(
+                self._sleeps_for(self._rate_limited(self.FROZEN_PLUS_45)),
+                [45, 45])
 
     def test_a_retry_after_past_the_cap_is_capped_not_obeyed(self):
         # Honouring it unbounded is the opposite mistake: an hour would be

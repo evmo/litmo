@@ -169,6 +169,28 @@ def _prior(ctx, art) -> dict:
     return e
 
 
+def _placed(entry: dict, art) -> bool:
+    """Does the manifest entry describe this artifact where it is now?
+
+    `tree_hash` cannot see a move. A directory's digest is built from paths
+    *relative to that directory* (`hashing.tree_hash`), so renaming
+    `data/cache` to `data/renamed`, or pointing it at a new object key,
+    leaves the digest byte-identical — and a push that compares only the
+    digest says "up to date" and returns before rewriting the entry. The
+    bucket then goes on describing the old layout: the bundle still holds
+    `data/cache/...`, so every reader's pull under the new configuration
+    refuses it as "the bundle is not the tree the manifest describes", and
+    no ordinary push ever mends it.
+
+    Only a disagreement counts. A pre-`path` entry written by an older tool
+    does not say where it put itself, and guessing that it moved would
+    re-upload every legacy archive on its next push to say something already
+    true.
+    """
+    return (entry.get("path", art.path.as_posix()) == art.path.as_posix()
+            and entry.get("key", art.key) == art.key)
+
+
 def _staging(cfg):
     """A scratch directory on the same filesystem as the checkout.
 
@@ -408,13 +430,25 @@ def _swap(staged: Path, dest: Path) -> None:
     temporary directory that was about to be removed. Either way a disk-full,
     I/O or concurrent-layout failure during the swap destroyed the local
     copy, on the one command whose bucket may be its only other copy.
+
+    An existing park is only a dead run's leftover while `dest` is still
+    there — then the live tree is the copy that counts and the park is a
+    superseded generation. With `dest` *absent* the same park is the
+    opposite: the previous run was killed between the rename and the move,
+    and that park holds the only local copy there is. Sweeping it first and
+    then failing the move left nothing at all, so it is adopted as the
+    outgoing copy instead and rolled back to `dest` exactly like one this
+    run parked itself.
     """
     parked = dest.parent / f".{dest.name}.litmo-old"
-    if parked.exists() or parked.is_symlink():
-        _discard(parked)                    # a run that was killed left it
-    outgoing = dest.exists() or dest.is_symlink()
-    if outgoing:
+    stale = parked.exists() or parked.is_symlink()
+    if dest.exists() or dest.is_symlink():
+        if stale:
+            _discard(parked)                # superseded by the live tree
         os.replace(dest, parked)
+        outgoing = True
+    else:
+        outgoing = stale                    # a killed run left the only copy
     try:
         _move(staged, dest)
     except BaseException:
@@ -464,7 +498,18 @@ def _install(staged: Path, dest: Path, *, clean: bool) -> bool:
     if staged.is_file():
         _move(staged, dest)
         return False
-    files = sorted(p for p in staged.rglob("*") if p.is_file())
+    # Everything the bundle carries that is not a directory. `is_file()`
+    # alone was silently wrong for two of the three link shapes a bundle can
+    # hold: it follows the link, so a symlink to a directory and a dangling
+    # symlink both answered False and were dropped on the floor, while one
+    # naming a regular file came through. The packer writes all three (see
+    # `_Tar.gettarinfo`) and `--clean` installs all three, so a merge that
+    # keeps only the last is the odd one out — and `tree_hash` selects with
+    # the same `is_file()`, so nothing afterwards could notice the loss.
+    # `rglob` does not descend through a link, so a directory symlink is one
+    # entry here and never a prefix of another.
+    files = sorted(p for p in staged.rglob("*")
+                   if p.is_symlink() or p.is_file())
     blocked = [c for src in files
                if (c := _blocked(dest / src.relative_to(staged), dest))]
     if blocked:
@@ -687,6 +732,14 @@ def archive_status(ctx, art) -> Report:
         verdict = LOCAL_ONLY
     elif not digest:
         verdict = REMOTE_ONLY
+    elif digest == remote.get("tree_hash") and not _placed(remote, art):
+        # Same bytes, published somewhere else — the artifact has been
+        # renamed or rekeyed since. `tree_hash` cannot see that (see
+        # `_placed`), so the digests agree while the bundle in the bucket
+        # still holds the old prefix and every reader's pull refuses it.
+        # Saying "in sync" here sends a maintainer away without the push
+        # that mends it, and exits zero so `make` agrees.
+        verdict, remote_s = DIFFERS, f"{remote_s} elsewhere"
     else:
         verdict = IN_SYNC if digest == remote.get("tree_hash") else DIFFERS
     return Report(local_s, remote_s, verdict)
@@ -840,7 +893,7 @@ def archive_push(ctx, art, *, force=False, dry_run=False) -> bool:
 
     digest, n, size = tree_hash(src)
     remote = _prior(ctx, art)
-    if remote.get("tree_hash") == digest and not force:
+    if remote.get("tree_hash") == digest and _placed(remote, art) and not force:
         print(f"  {art.name:9} up to date  ({n:,} files, {human(size)})")
         return False
     # Compared again after packing; see the re-read below. Taken here rather
